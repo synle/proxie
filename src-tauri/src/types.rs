@@ -62,6 +62,74 @@ pub struct ConnectionLog {
     pub intercepted: bool,
 }
 
+/// An intercept rule defines how to handle a matched request.
+/// Uses HAR-inspired response format for easy import/export.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterceptRule {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    /// Match criteria
+    pub match_host: String,
+    pub match_path: String,
+    pub match_method: Option<String>,
+    /// Action: "mock" returns a hardcoded response, "reroute" forwards to a different target
+    pub action: InterceptAction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum InterceptAction {
+    /// Return a hardcoded response (HAR-inspired format)
+    #[serde(rename = "mock")]
+    Mock { response: HarResponse },
+    /// Reroute to a different target URL
+    #[serde(rename = "reroute")]
+    Reroute { target_url: String },
+}
+
+/// HAR-inspired response object.
+/// Follows the HAR 1.2 spec response shape for future import compatibility.
+/// See: http://www.softwareishard.com/blog/har-12-spec/#response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HarResponse {
+    pub status: u16,
+    pub status_text: String,
+    pub headers: Vec<HarHeader>,
+    pub content: HarContent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HarHeader {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HarContent {
+    pub size: i64,
+    pub mime_type: String,
+    pub text: Option<String>,
+}
+
+impl Default for HarResponse {
+    fn default() -> Self {
+        Self {
+            status: 200,
+            status_text: "OK".to_string(),
+            headers: vec![HarHeader {
+                name: "Content-Type".to_string(),
+                value: "application/json".to_string(),
+            }],
+            content: HarContent {
+                size: 0,
+                mime_type: "application/json".to_string(),
+                text: Some("{}".to_string()),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyStatus {
     pub running: bool,
@@ -137,6 +205,76 @@ mod tests {
         let back: ConnectionLog = serde_json::from_str(&json).unwrap();
         assert_eq!(back.status, Some(200));
         assert_eq!(back.duration_ms, Some(123));
+    }
+
+    #[test]
+    fn test_intercept_rule_mock_serde() {
+        let rule = InterceptRule {
+            id: "ir1".to_string(),
+            name: "Mock /api/users".to_string(),
+            enabled: true,
+            match_host: "api.example.com".to_string(),
+            match_path: "/api/users".to_string(),
+            match_method: Some("GET".to_string()),
+            action: InterceptAction::Mock {
+                response: HarResponse {
+                    status: 200,
+                    status_text: "OK".to_string(),
+                    headers: vec![HarHeader {
+                        name: "Content-Type".to_string(),
+                        value: "application/json".to_string(),
+                    }],
+                    content: HarContent {
+                        size: 27,
+                        mime_type: "application/json".to_string(),
+                        text: Some(r#"{"users":["alice","bob"]}"#.to_string()),
+                    },
+                },
+            },
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        assert!(json.contains("\"type\":\"mock\""));
+        let back: InterceptRule = serde_json::from_str(&json).unwrap();
+        match &back.action {
+            InterceptAction::Mock { response } => {
+                assert_eq!(response.status, 200);
+                assert!(response.content.text.as_ref().unwrap().contains("alice"));
+            }
+            _ => panic!("Expected Mock action"),
+        }
+    }
+
+    #[test]
+    fn test_intercept_rule_reroute_serde() {
+        let rule = InterceptRule {
+            id: "ir2".to_string(),
+            name: "Reroute to staging".to_string(),
+            enabled: true,
+            match_host: "api.example.com".to_string(),
+            match_path: "/api/*".to_string(),
+            match_method: None,
+            action: InterceptAction::Reroute {
+                target_url: "https://staging.example.com".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        assert!(json.contains("\"type\":\"reroute\""));
+        let back: InterceptRule = serde_json::from_str(&json).unwrap();
+        match &back.action {
+            InterceptAction::Reroute { target_url } => {
+                assert_eq!(target_url, "https://staging.example.com");
+            }
+            _ => panic!("Expected Reroute action"),
+        }
+    }
+
+    #[test]
+    fn test_har_response_default() {
+        let resp = HarResponse::default();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.status_text, "OK");
+        assert_eq!(resp.headers.len(), 1);
+        assert_eq!(resp.content.mime_type, "application/json");
     }
 
     #[test]

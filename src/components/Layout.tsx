@@ -18,6 +18,7 @@ import FilterListIcon from '@mui/icons-material/FilterList';
 import SwapHorizIcon from '@mui/icons-material/SwapHoriz';
 import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import StopIcon from '@mui/icons-material/Stop';
+import AltRouteIcon from '@mui/icons-material/AltRoute';
 import { invoke } from '@tauri-apps/api/core';
 
 const DRAWER_WIDTH = 220;
@@ -25,6 +26,7 @@ const DRAWER_WIDTH = 220;
 const navItems = [
   { label: 'Connections', path: '/connections', icon: <SwapHorizIcon /> },
   { label: 'Host Rules', path: '/hosts', icon: <FilterListIcon /> },
+  { label: 'Interceptor', path: '/interceptor', icon: <AltRouteIcon /> },
   { label: 'Setup', path: '/setup', icon: <SettingsIcon /> },
 ];
 

@@ -4,6 +4,7 @@ import Layout from './components/Layout';
 import SetupPage from './pages/SetupPage';
 import HostRulesPage from './pages/HostRulesPage';
 import ConnectionsPage from './pages/ConnectionsPage';
+import InterceptorPage from './pages/InterceptorPage';
 
 const darkTheme = createTheme({
   palette: {
@@ -28,6 +29,7 @@ export default function App() {
             <Route path='/setup' element={<SetupPage />} />
             <Route path='/hosts' element={<HostRulesPage />} />
             <Route path='/connections' element={<ConnectionsPage />} />
+            <Route path='/interceptor' element={<InterceptorPage />} />
             <Route path='*' element={<Navigate to='/connections' replace />} />
           </Routes>
         </Layout>

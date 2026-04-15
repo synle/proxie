@@ -1,7 +1,7 @@
 use crate::state::AppState;
-use crate::types::{ConnectionLog, ProxyStatus};
+use crate::types::{ConnectionLog, InterceptAction, ProxyStatus};
 use std::sync::Arc;
-use tauri::{Emitter, AppHandle};
+use tauri::{AppHandle, Emitter};
 
 /// Start the HTTP/HTTPS proxy server.
 pub async fn start_proxy(
@@ -88,7 +88,7 @@ async fn handle_connection(
         // HTTPS tunnel: respond with 200 and relay bytes
         handle_connect_tunnel(&mut client_stream, target, &state, &app_handle, start).await?;
     } else {
-        // Plain HTTP: forward the request
+        // Plain HTTP: forward the request (or intercept)
         handle_http_request(
             &mut client_stream,
             method,
@@ -121,7 +121,9 @@ async fn handle_connect_tunnel(
 
     // Check if this host is being tracked
     let rules = state.get_host_rules().await.unwrap_or_default();
-    let is_tracked = rules.iter().any(|r| r.enabled && host_matches(&r.host, host));
+    let is_tracked = rules
+        .iter()
+        .any(|r| r.enabled && host_matches(&r.host, host));
 
     // Connect to the upstream server
     let upstream_addr = format!("{}:{}", host, port);
@@ -161,7 +163,8 @@ async fn handle_connect_tunnel(
     }
 
     // Relay bytes bidirectionally
-    let (mut client_read, mut client_write) = tokio::io::split(tokio::io::BufReader::new(client_stream));
+    let (mut client_read, mut client_write) =
+        tokio::io::split(tokio::io::BufReader::new(client_stream));
     let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
 
     let c2u = tokio::io::copy(&mut client_read, &mut upstream_write);
@@ -184,10 +187,46 @@ async fn handle_http_request(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // Parse host from URL or Host header
-    let host = extract_host(url, &String::from_utf8_lossy(request_data));
+    let request_str = String::from_utf8_lossy(request_data);
+    let host = extract_host(url, &request_str);
     let path = extract_path(url);
 
-    // Connect to upstream
+    // Extract request body (everything after \r\n\r\n)
+    let request_body = request_str
+        .find("\r\n\r\n")
+        .map(|idx| request_str[idx + 4..].to_string())
+        .filter(|s| !s.is_empty());
+
+    // Extract request headers
+    let request_headers: Vec<(String, String)> = request_str
+        .lines()
+        .skip(1) // skip request line
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| {
+            let mut parts = line.splitn(2, ": ");
+            Some((parts.next()?.to_string(), parts.next()?.to_string()))
+        })
+        .collect();
+
+    // Check for matching intercept rule
+    if let Some(rule) = state.find_intercept_rule(&host, &path, method).await {
+        return handle_intercepted_request(
+            client_stream,
+            method,
+            url,
+            &host,
+            &path,
+            &request_headers,
+            &request_body,
+            &rule.action,
+            state,
+            app_handle,
+            start,
+        )
+        .await;
+    }
+
+    // No intercept — forward normally
     let port = extract_port(url).unwrap_or(80);
     let upstream_addr = format!("{}:{}", host, port);
     let mut upstream = tokio::net::TcpStream::connect(&upstream_addr).await?;
@@ -204,13 +243,9 @@ async fn handle_http_request(
             break;
         }
         response_buf.extend_from_slice(&tmp[..n]);
-        // Simple heuristic: if we got headers and it looks complete, break
         if response_buf.len() > 4
-            && response_buf
-                .windows(4)
-                .any(|w| w == b"\r\n\r\n")
+            && response_buf.windows(4).any(|w| w == b"\r\n\r\n")
         {
-            // Try one more read with a short timeout
             match tokio::time::timeout(
                 std::time::Duration::from_millis(100),
                 upstream.read(&mut tmp),
@@ -247,9 +282,9 @@ async fn handle_http_request(
         request_size: Some(request_data.len() as u64),
         response_size: Some(response_buf.len() as u64),
         timestamp: chrono::Utc::now().to_rfc3339(),
-        request_headers: vec![],
+        request_headers,
         response_headers: vec![],
-        request_body: None,
+        request_body,
         response_body: None,
         content_type: None,
         intercepted: false,
@@ -260,8 +295,183 @@ async fn handle_http_request(
     Ok(())
 }
 
+/// Handle an intercepted request — either mock a response or reroute.
+async fn handle_intercepted_request(
+    client_stream: &mut tokio::net::TcpStream,
+    method: &str,
+    url: &str,
+    host: &str,
+    path: &str,
+    request_headers: &[(String, String)],
+    request_body: &Option<String>,
+    action: &InterceptAction,
+    state: &Arc<AppState>,
+    app_handle: &AppHandle,
+    start: std::time::Instant,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    match action {
+        InterceptAction::Mock { response } => {
+            // Build HTTP response from HAR response object
+            let body = response.content.text.as_deref().unwrap_or("");
+            let body_bytes = body.as_bytes();
+
+            let mut resp = format!(
+                "HTTP/1.1 {} {}\r\n",
+                response.status, response.status_text
+            );
+
+            // Add HAR headers
+            for header in &response.headers {
+                resp.push_str(&format!("{}: {}\r\n", header.name, header.value));
+            }
+
+            // Add Content-Length if not already present
+            let has_content_length = response
+                .headers
+                .iter()
+                .any(|h| h.name.to_lowercase() == "content-length");
+            if !has_content_length {
+                resp.push_str(&format!("Content-Length: {}\r\n", body_bytes.len()));
+            }
+
+            resp.push_str("\r\n");
+
+            let mut full_response = resp.into_bytes();
+            full_response.extend_from_slice(body_bytes);
+
+            client_stream.write_all(&full_response).await?;
+
+            let duration_ms = start.elapsed().as_millis() as u64;
+
+            let content_type = response
+                .headers
+                .iter()
+                .find(|h| h.name.to_lowercase() == "content-type")
+                .map(|h| h.value.clone())
+                .unwrap_or_else(|| response.content.mime_type.clone());
+
+            let response_headers: Vec<(String, String)> = response
+                .headers
+                .iter()
+                .map(|h| (h.name.clone(), h.value.clone()))
+                .collect();
+
+            let conn = ConnectionLog {
+                id: uuid::Uuid::new_v4().to_string(),
+                method: method.to_string(),
+                url: url.to_string(),
+                host: host.to_string(),
+                path: path.to_string(),
+                status: Some(response.status),
+                duration_ms: Some(duration_ms),
+                request_size: None,
+                response_size: Some(full_response.len() as u64),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                request_headers: request_headers.to_vec(),
+                response_headers,
+                request_body: request_body.clone(),
+                response_body: Some(body.to_string()),
+                content_type: Some(content_type),
+                intercepted: true,
+            };
+            state.add_connection(conn.clone()).await;
+            let _ = app_handle.emit("proxy:connection", &conn);
+
+            log::info!("Intercepted {} {} -> Mock {} ", method, url, response.status);
+        }
+
+        InterceptAction::Reroute { target_url } => {
+            // Reroute: connect to a different target
+            let reroute_host = extract_host(target_url, "");
+            let reroute_port = extract_port(target_url).unwrap_or(80);
+            let reroute_addr = format!("{}:{}", reroute_host, reroute_port);
+
+            let mut upstream = tokio::net::TcpStream::connect(&reroute_addr).await?;
+
+            // Rewrite the request line to target the reroute URL
+            let request_str = format!(
+                "{} {} HTTP/1.1\r\nHost: {}\r\n",
+                method,
+                extract_path(target_url),
+                reroute_host
+            );
+
+            // Send rewritten request
+            upstream.write_all(request_str.as_bytes()).await?;
+
+            // Read response from rerouted target
+            let mut response_buf = Vec::new();
+            let mut tmp = vec![0u8; 8192];
+            loop {
+                let n = upstream.read(&mut tmp).await?;
+                if n == 0 {
+                    break;
+                }
+                response_buf.extend_from_slice(&tmp[..n]);
+                if response_buf.len() > 4
+                    && response_buf.windows(4).any(|w| w == b"\r\n\r\n")
+                {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        upstream.read(&mut tmp),
+                    )
+                    .await
+                    {
+                        Ok(Ok(n)) if n > 0 => response_buf.extend_from_slice(&tmp[..n]),
+                        _ => break,
+                    }
+                }
+            }
+
+            let duration_ms = start.elapsed().as_millis() as u64;
+
+            // Forward response to client
+            client_stream.write_all(&response_buf).await?;
+
+            let response_str = String::from_utf8_lossy(&response_buf);
+            let status = response_str
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|s| s.parse::<u16>().ok());
+
+            let conn = ConnectionLog {
+                id: uuid::Uuid::new_v4().to_string(),
+                method: method.to_string(),
+                url: url.to_string(),
+                host: host.to_string(),
+                path: path.to_string(),
+                status,
+                duration_ms: Some(duration_ms),
+                request_size: None,
+                response_size: Some(response_buf.len() as u64),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                request_headers: request_headers.to_vec(),
+                response_headers: vec![],
+                request_body: request_body.clone(),
+                response_body: None,
+                content_type: None,
+                intercepted: true,
+            };
+            state.add_connection(conn.clone()).await;
+            let _ = app_handle.emit("proxy:connection", &conn);
+
+            log::info!(
+                "Intercepted {} {} -> Reroute to {}",
+                method,
+                url,
+                target_url
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Check if a host matches a rule pattern (supports wildcard prefix like *.example.com).
-fn host_matches(pattern: &str, host: &str) -> bool {
+pub fn host_matches(pattern: &str, host: &str) -> bool {
     if pattern.starts_with("*.") {
         let suffix = &pattern[1..]; // ".example.com"
         host.ends_with(suffix) || host == &pattern[2..]
@@ -272,7 +482,10 @@ fn host_matches(pattern: &str, host: &str) -> bool {
 
 fn extract_host(url: &str, request: &str) -> String {
     // Try from URL first
-    if let Some(rest) = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://")) {
+    if let Some(rest) = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+    {
         if let Some(host) = rest.split('/').next() {
             let host = host.split(':').next().unwrap_or(host);
             if !host.is_empty() {
@@ -282,7 +495,10 @@ fn extract_host(url: &str, request: &str) -> String {
     }
     // Fall back to Host header
     for line in request.lines() {
-        if let Some(host) = line.strip_prefix("Host: ").or_else(|| line.strip_prefix("host: ")) {
+        if let Some(host) = line
+            .strip_prefix("Host: ")
+            .or_else(|| line.strip_prefix("host: "))
+        {
             return host.split(':').next().unwrap_or(host).trim().to_string();
         }
     }
@@ -290,7 +506,10 @@ fn extract_host(url: &str, request: &str) -> String {
 }
 
 fn extract_path(url: &str) -> String {
-    if let Some(rest) = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://")) {
+    if let Some(rest) = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+    {
         if let Some(idx) = rest.find('/') {
             return rest[idx..].to_string();
         }
@@ -299,7 +518,10 @@ fn extract_path(url: &str) -> String {
 }
 
 fn extract_port(url: &str) -> Option<u16> {
-    if let Some(rest) = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://")) {
+    if let Some(rest) = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+    {
         let host_part = rest.split('/').next()?;
         if let Some(port_str) = host_part.split(':').nth(1) {
             return port_str.parse().ok();
@@ -308,9 +530,46 @@ fn extract_port(url: &str) -> Option<u16> {
     None
 }
 
+/// Build a mock HTTP response bytes from an InterceptAction::Mock.
+/// Used by the proxy engine and available for external testing/validation.
+#[allow(dead_code)]
+pub fn build_mock_response(action: &InterceptAction) -> Option<Vec<u8>> {
+    match action {
+        InterceptAction::Mock { response } => {
+            let body = response.content.text.as_deref().unwrap_or("");
+            let body_bytes = body.as_bytes();
+
+            let mut resp = format!(
+                "HTTP/1.1 {} {}\r\n",
+                response.status, response.status_text
+            );
+
+            for header in &response.headers {
+                resp.push_str(&format!("{}: {}\r\n", header.name, header.value));
+            }
+
+            let has_content_length = response
+                .headers
+                .iter()
+                .any(|h| h.name.to_lowercase() == "content-length");
+            if !has_content_length {
+                resp.push_str(&format!("Content-Length: {}\r\n", body_bytes.len()));
+            }
+
+            resp.push_str("\r\n");
+
+            let mut full = resp.into_bytes();
+            full.extend_from_slice(body_bytes);
+            Some(full)
+        }
+        InterceptAction::Reroute { .. } => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{HarContent, HarHeader, HarResponse, InterceptAction};
 
     #[test]
     fn test_host_matches_exact() {
@@ -361,5 +620,113 @@ mod tests {
         assert_eq!(extract_port("http://example.com:8080/path"), Some(8080));
         assert_eq!(extract_port("http://example.com/path"), None);
         assert_eq!(extract_port("https://secure.com:443/"), Some(443));
+    }
+
+    #[test]
+    fn test_build_mock_response_200() {
+        let action = InterceptAction::Mock {
+            response: HarResponse {
+                status: 200,
+                status_text: "OK".to_string(),
+                headers: vec![HarHeader {
+                    name: "Content-Type".to_string(),
+                    value: "application/json".to_string(),
+                }],
+                content: HarContent {
+                    size: 13,
+                    mime_type: "application/json".to_string(),
+                    text: Some(r#"{"ok":true}"#.to_string()),
+                },
+            },
+        };
+        let resp = build_mock_response(&action).unwrap();
+        let resp_str = String::from_utf8(resp).unwrap();
+        assert!(resp_str.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(resp_str.contains("Content-Type: application/json"));
+        assert!(resp_str.contains("Content-Length: 11"));
+        assert!(resp_str.ends_with(r#"{"ok":true}"#));
+    }
+
+    #[test]
+    fn test_build_mock_response_custom_status() {
+        let action = InterceptAction::Mock {
+            response: HarResponse {
+                status: 404,
+                status_text: "Not Found".to_string(),
+                headers: vec![],
+                content: HarContent {
+                    size: 0,
+                    mime_type: "text/plain".to_string(),
+                    text: Some("not found".to_string()),
+                },
+            },
+        };
+        let resp = build_mock_response(&action).unwrap();
+        let resp_str = String::from_utf8(resp).unwrap();
+        assert!(resp_str.starts_with("HTTP/1.1 404 Not Found\r\n"));
+        assert!(resp_str.contains("Content-Length: 9"));
+    }
+
+    #[test]
+    fn test_build_mock_response_with_multiple_headers() {
+        let action = InterceptAction::Mock {
+            response: HarResponse {
+                status: 302,
+                status_text: "Found".to_string(),
+                headers: vec![
+                    HarHeader {
+                        name: "Location".to_string(),
+                        value: "https://other.com".to_string(),
+                    },
+                    HarHeader {
+                        name: "X-Custom".to_string(),
+                        value: "test-value".to_string(),
+                    },
+                ],
+                content: HarContent {
+                    size: 0,
+                    mime_type: "text/html".to_string(),
+                    text: None,
+                },
+            },
+        };
+        let resp = build_mock_response(&action).unwrap();
+        let resp_str = String::from_utf8(resp).unwrap();
+        assert!(resp_str.contains("Location: https://other.com"));
+        assert!(resp_str.contains("X-Custom: test-value"));
+        assert!(resp_str.contains("Content-Length: 0"));
+    }
+
+    #[test]
+    fn test_build_mock_response_reroute_returns_none() {
+        let action = InterceptAction::Reroute {
+            target_url: "https://staging.example.com".to_string(),
+        };
+        assert!(build_mock_response(&action).is_none());
+    }
+
+    #[test]
+    fn test_build_mock_response_explicit_content_length() {
+        let action = InterceptAction::Mock {
+            response: HarResponse {
+                status: 200,
+                status_text: "OK".to_string(),
+                headers: vec![HarHeader {
+                    name: "Content-Length".to_string(),
+                    value: "42".to_string(),
+                }],
+                content: HarContent {
+                    size: 5,
+                    mime_type: "text/plain".to_string(),
+                    text: Some("hello".to_string()),
+                },
+            },
+        };
+        let resp = build_mock_response(&action).unwrap();
+        let resp_str = String::from_utf8(resp).unwrap();
+        // Should use the explicit Content-Length, not auto-add one
+        let count = resp_str.matches("Content-Length").count();
+        assert_eq!(count, 1);
+        assert!(resp_str.contains("Content-Length: 42"));
     }
 }

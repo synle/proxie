@@ -1,5 +1,5 @@
 use crate::cert;
-use crate::types::{CertInfo, ConnectionLog, HostRule, ProxyConfig, ProxyStatus};
+use crate::types::{CertInfo, ConnectionLog, HostRule, InterceptRule, ProxyConfig, ProxyStatus};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,6 +11,8 @@ use tokio::sync::{Mutex, Notify};
 struct PersistedState {
     proxy_config: ProxyConfig,
     host_rules: Vec<HostRule>,
+    #[serde(default)]
+    intercept_rules: Vec<InterceptRule>,
 }
 
 impl Default for PersistedState {
@@ -18,6 +20,7 @@ impl Default for PersistedState {
         Self {
             proxy_config: ProxyConfig::default(),
             host_rules: Vec::new(),
+            intercept_rules: Vec::new(),
         }
     }
 }
@@ -140,6 +143,83 @@ impl AppState {
         self.get_host_rules().await
     }
 
+    // Intercept rules
+    pub async fn get_intercept_rules(
+        &self,
+    ) -> Result<Vec<InterceptRule>, Box<dyn std::error::Error>> {
+        let state = self.persisted.lock().await;
+        Ok(state.intercept_rules.clone())
+    }
+
+    pub async fn add_intercept_rule(
+        &self,
+        rule: InterceptRule,
+    ) -> Result<Vec<InterceptRule>, Box<dyn std::error::Error>> {
+        {
+            let mut state = self.persisted.lock().await;
+            state.intercept_rules.push(rule);
+        }
+        self.save().await?;
+        self.get_intercept_rules().await
+    }
+
+    pub async fn update_intercept_rule(
+        &self,
+        rule: InterceptRule,
+    ) -> Result<Vec<InterceptRule>, Box<dyn std::error::Error>> {
+        {
+            let mut state = self.persisted.lock().await;
+            if let Some(existing) = state.intercept_rules.iter_mut().find(|r| r.id == rule.id) {
+                *existing = rule;
+            }
+        }
+        self.save().await?;
+        self.get_intercept_rules().await
+    }
+
+    pub async fn delete_intercept_rule(
+        &self,
+        id: &str,
+    ) -> Result<Vec<InterceptRule>, Box<dyn std::error::Error>> {
+        {
+            let mut state = self.persisted.lock().await;
+            state.intercept_rules.retain(|r| r.id != id);
+        }
+        self.save().await?;
+        self.get_intercept_rules().await
+    }
+
+    /// Find a matching intercept rule for a given request.
+    pub async fn find_intercept_rule(
+        &self,
+        host: &str,
+        path: &str,
+        method: &str,
+    ) -> Option<InterceptRule> {
+        let state = self.persisted.lock().await;
+        state
+            .intercept_rules
+            .iter()
+            .find(|r| {
+                if !r.enabled {
+                    return false;
+                }
+                if !crate::proxy::host_matches(&r.match_host, host) {
+                    return false;
+                }
+                if !path_matches(&r.match_path, path) {
+                    return false;
+                }
+                if let Some(ref m) = r.match_method {
+                    if m.to_uppercase() != method.to_uppercase() {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+    }
+
     // Connections
     pub async fn get_connections(&self) -> Result<Vec<ConnectionLog>, Box<dyn std::error::Error>> {
         let conns = self.connections.lock().await;
@@ -189,9 +269,85 @@ impl AppState {
     }
 }
 
+/// Match a path pattern against a request path.
+/// Supports wildcard suffix (e.g., "/api/*" matches "/api/users", "/api/users/1").
+/// Exact match without wildcard.
+fn path_matches(pattern: &str, path: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix("/*") {
+        path == prefix || path.starts_with(&format!("{}/", prefix))
+    } else if pattern.ends_with('*') {
+        let prefix = &pattern[..pattern.len() - 1];
+        path.starts_with(prefix)
+    } else {
+        pattern == path
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{HarResponse, InterceptAction};
+
+    #[test]
+    fn test_path_matches_exact() {
+        assert!(path_matches("/api/users", "/api/users"));
+        assert!(!path_matches("/api/users", "/api/other"));
+    }
+
+    #[test]
+    fn test_path_matches_wildcard_suffix() {
+        assert!(path_matches("/api/*", "/api/users"));
+        assert!(path_matches("/api/*", "/api/users/1"));
+        assert!(path_matches("/api/*", "/api"));
+        assert!(!path_matches("/api/*", "/other"));
+    }
+
+    #[test]
+    fn test_path_matches_star_all() {
+        assert!(path_matches("*", "/anything"));
+        assert!(path_matches("*", "/"));
+    }
+
+    #[test]
+    fn test_path_matches_prefix_star() {
+        assert!(path_matches("/api/v*", "/api/v1"));
+        assert!(path_matches("/api/v*", "/api/v2/users"));
+        assert!(!path_matches("/api/v*", "/api/users"));
+    }
+
+    #[test]
+    fn test_persisted_state_with_intercept_rules() {
+        let state = PersistedState {
+            proxy_config: ProxyConfig::default(),
+            host_rules: vec![],
+            intercept_rules: vec![InterceptRule {
+                id: "ir1".to_string(),
+                name: "Mock users".to_string(),
+                enabled: true,
+                match_host: "api.example.com".to_string(),
+                match_path: "/api/users".to_string(),
+                match_method: Some("GET".to_string()),
+                action: InterceptAction::Mock {
+                    response: HarResponse::default(),
+                },
+            }],
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let back: PersistedState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.intercept_rules.len(), 1);
+        assert_eq!(back.intercept_rules[0].name, "Mock users");
+    }
+
+    #[test]
+    fn test_persisted_state_backward_compat() {
+        // Old config without intercept_rules should still deserialize
+        let json = r#"{"proxy_config":{"port":8899,"listen_addr":"127.0.0.1","ssl_enabled":true},"host_rules":[]}"#;
+        let state: PersistedState = serde_json::from_str(json).unwrap();
+        assert!(state.intercept_rules.is_empty());
+    }
 
     #[test]
     fn test_persisted_state_default() {
@@ -214,6 +370,7 @@ mod tests {
                 enabled: true,
                 ignore_paths: vec![],
             }],
+            intercept_rules: vec![],
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: PersistedState = serde_json::from_str(&json).unwrap();

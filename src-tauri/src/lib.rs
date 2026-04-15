@@ -6,7 +6,7 @@ mod types;
 use state::AppState;
 use std::sync::Arc;
 use tauri::Manager;
-use types::{CertInfo, ConnectionLog, HostRule, ProxyConfig, ProxyStatus};
+use types::{CertInfo, ConnectionLog, HostRule, InterceptRule, ProxyConfig, ProxyStatus};
 
 #[tauri::command]
 async fn generate_cert(
@@ -75,6 +75,49 @@ async fn delete_host_rule(
 }
 
 #[tauri::command]
+async fn get_intercept_rules(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Vec<InterceptRule>, String> {
+    state
+        .get_intercept_rules()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn add_intercept_rule(
+    state: tauri::State<'_, Arc<AppState>>,
+    rule: InterceptRule,
+) -> Result<Vec<InterceptRule>, String> {
+    state
+        .add_intercept_rule(rule)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn update_intercept_rule(
+    state: tauri::State<'_, Arc<AppState>>,
+    rule: InterceptRule,
+) -> Result<Vec<InterceptRule>, String> {
+    state
+        .update_intercept_rule(rule)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn delete_intercept_rule(
+    state: tauri::State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<Vec<InterceptRule>, String> {
+    state
+        .delete_intercept_rule(&id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn get_connections(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<Vec<ConnectionLog>, String> {
@@ -132,6 +175,10 @@ pub fn run() {
             add_host_rule,
             update_host_rule,
             delete_host_rule,
+            get_intercept_rules,
+            add_intercept_rule,
+            update_intercept_rule,
+            delete_intercept_rule,
             get_connections,
             clear_connections,
             start_proxy,
