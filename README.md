@@ -2,53 +2,113 @@
 
 A lightweight HTTPS proxy interceptor — like Charles Proxy, but free and fast.
 
-Built with [Tauri v2](https://v2.tauri.app/) + React + MUI.
+Built with [Tauri v2](https://v2.tauri.app/) + React 18 + MUI 7 + Rust.
+
+## Why Proxie?
+
+- **Charles Proxy** costs $50 and runs on Java (slow)
+- **Wireshark** is over-engineered for API debugging
+- **HTTP Toolkit** free tier is limited; Electron is heavy
+- **Proxie** is free, native (Rust + system WebView), and focused on API interception
 
 ## Features
 
-- **HTTPS Interception** — Self-signed CA certificate generation with one-click install instructions for macOS, Windows, and Linux
-- **Host Tracking** — Configure which hosts to monitor with wildcard support (`*.example.com`)
-- **Live Connections** — Real-time traffic view with duration visualization, filtering, and request/response detail inspection
-- **Request Interceptor** — Define custom routing rules: reroute requests or return hardcoded responses with HAR-format support
+- **HTTPS Interception** — Self-signed CA certificate generation with one-command install for macOS, Windows, and Linux
+- **Host Tracking** — Configure which hosts to monitor with wildcard support (`*.example.com`) and ignore paths (`/health`, `/metrics`)
+- **Live Connections** — Real-time traffic table with duration bars, status color coding, filtering, and request/response detail drawer
+- **Request Interceptor** — Mock responses (HAR format) or reroute requests to different targets, with access to request body/headers for dynamic behavior
 
 ## Quick Start
 
+### Prerequisites
+
+- [Node.js](https://nodejs.org/) 20+
+- [Rust](https://rustup.rs/) 1.75+
+- Platform dependencies (see [DEV.md](DEV.md) for details)
+
+### Run Locally
+
 ```bash
-# Install dependencies
+# Install frontend dependencies
 npm install
 
-# Run in development mode
+# Start the app in development mode (hot-reload for frontend + Rust rebuild)
 npx tauri dev
 
-# Run tests
-npm test                          # Frontend tests
-cd src-tauri && cargo test        # Rust tests
+# Or run just the frontend dev server (no Tauri/Rust)
+npm run dev
+```
 
-# Build for production
+### Run Tests
+
+```bash
+# Frontend tests (Vitest + React Testing Library)
+npm test
+
+# Rust tests
+cd src-tauri && cargo test
+
+# TypeScript type check
+npx tsc --noEmit
+```
+
+### Build for Production
+
+```bash
 npx tauri build
 ```
 
-## Architecture
-
-```
-src/                  # React frontend (TypeScript + MUI)
-├── pages/
-│   ├── SetupPage       # Proxy config + SSL certificate management
-│   ├── HostRulesPage   # Host tracking rules (add/edit/delete)
-│   └── ConnectionsPage # Live traffic view + detail drawer
-src-tauri/            # Rust backend
-├── src/
-│   ├── lib.rs          # Tauri commands + app setup
-│   ├── proxy.rs        # HTTP/HTTPS proxy engine
-│   ├── cert.rs         # CA certificate generation (rcgen)
-│   ├── state.rs        # App state management + persistence
-│   └── types.rs        # Shared data types
-```
+Outputs platform-specific installers in `src-tauri/target/release/bundle/`:
+- macOS: `.dmg`, `.app`
+- Windows: `.exe` (NSIS), `.msi`
+- Linux: `.deb`, `.AppImage`, `.rpm`
 
 ## Proxy Setup
 
-1. Go to **Setup** page and generate a CA certificate
-2. Follow the platform-specific instructions to install it in your system trust store
-3. Configure your system/browser to use HTTP proxy at `127.0.0.1:8899`
-4. Add host rules on the **Host Rules** page
-5. Start the proxy and watch traffic on the **Connections** page
+1. Launch Proxie and go to the **Setup** page
+2. Click **Generate CA Certificate**
+3. Follow the platform-specific instructions to install it in your system trust store:
+
+   **macOS:**
+   ```bash
+   sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "<cert-path>"
+   ```
+
+   **Windows (Admin):**
+   ```bash
+   certutil -addstore -f "ROOT" "<cert-path>"
+   ```
+
+   **Linux (Ubuntu):**
+   ```bash
+   sudo cp "<cert-path>" /usr/local/share/ca-certificates/proxie-ca.crt
+   sudo update-ca-certificates
+   ```
+
+4. Configure your system or browser to use HTTP proxy at `127.0.0.1:8899`
+5. Add host rules on the **Host Rules** page to track specific domains
+6. Click the play button to start the proxy
+7. Watch live traffic on the **Connections** page
+
+## Pages
+
+| Page | Description |
+|------|-------------|
+| **Connections** | Live traffic table with duration visualization, filter, and detail drawer |
+| **Host Rules** | CRUD for host tracking rules with wildcard and ignore-path support |
+| **Interceptor** | Mock responses (HAR format) or reroute requests to different targets |
+| **Setup** | Proxy config (port, address) and SSL certificate management |
+
+## Tech Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Desktop framework | Tauri v2 |
+| Frontend | React 18, TypeScript, MUI 7, Vite 6 |
+| Backend | Rust, Tokio, Hyper |
+| TLS | rcgen (cert generation), rustls, tokio-rustls |
+| CI/CD | GitHub Actions (macOS, Windows, Linux) |
+
+## License
+
+MIT
