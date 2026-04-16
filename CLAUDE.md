@@ -69,10 +69,10 @@ src-tauri/src/                 # Rust backend
 
 ## GitHub Raw File URLs
 
-When fetching raw file content from GitHub repos, always use the `?raw=true` blob URL format:
+When fetching raw file content from GitHub repos, always use the `?raw=1` blob URL format:
 
 ```
-https://github.com/{owner}/{repo}/blob/head/{path}?raw=true
+https://github.com/{owner}/{repo}/blob/head/{path}?raw=1
 ```
 
 Do NOT use:
