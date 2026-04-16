@@ -67,6 +67,19 @@ src-tauri/src/                 # Rust backend
 - 4-platform matrix: macOS ARM, macOS Intel, Windows, Linux
 - PR builds post artifact download links as comments
 
+## GitHub Raw File URLs
+
+When fetching raw file content from GitHub repos, always use the `?raw=true` blob URL format:
+
+```
+https://github.com/{owner}/{repo}/blob/head/{path}?raw=true
+```
+
+Do NOT use:
+
+- `https://api.github.com/repos/{owner}/{repo}/contents/{path}` (GitHub Contents API)
+- `https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}`
+
 ## Common tasks
 
 - **Add a new Tauri command:** Define in `lib.rs`, implement in `state.rs`, register in `generate_handler![]`
