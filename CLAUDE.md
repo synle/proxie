@@ -86,3 +86,9 @@ Do NOT use:
 - **Add a new page:** Create in `src/pages/`, add route in `App.tsx`, add nav item in `Layout.tsx`
 - **Add a new persisted field:** Add to `PersistedState` with `#[serde(default)]`, add CRUD methods to `AppState`
 - **Add a new data type:** Define in `types.rs` with `Serialize, Deserialize`, add tests
+
+
+## Git / PR Merge Policy
+
+- Always use **squash and merge** when merging PRs. Never use merge commits or rebase merges. This keeps the git history clean with one commit per PR.
+- You may `git merge origin/main` or `git merge origin/master` locally to sync branches, but PR merges must always be squash merges.
