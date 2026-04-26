@@ -22,6 +22,12 @@ cd src-tauri && cargo test     # Rust tests
 npx tsc --noEmit               # TypeScript type check
 ```
 
+**VSCode debugging:** `.vscode/launch.json` provides three configs — Tauri
+Dev (lldb-based, runs Rust + Vite together via the `ui:dev` task in
+`.vscode/tasks.json`), Vitest run-all, and Vitest debug-current-file. The
+`!.vscode/launch.json` and `!.vscode/tasks.json` un-ignore rules in
+`.gitignore` keep these tracked while excluding personal `settings.json`.
+
 ## Project layout
 
 ```

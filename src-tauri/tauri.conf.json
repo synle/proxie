@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicoverbruggen/tauri-v2-docs/refs/heads/main/schemas/config.schema.json",
   "productName": "Proxie",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "identifier": "com.synle.proxie",
   "build": {
     "beforeDevCommand": "npm run dev",
