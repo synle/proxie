@@ -2,7 +2,7 @@
 
 A lightweight HTTPS proxy interceptor — like Charles Proxy, but free and fast.
 
-Built with [Tauri v2](https://v2.tauri.app/) + React 18 + MUI 7 + Rust.
+Built with [Tauri v2](https://v2.tauri.app/) + React 19 + MUI 9 + Rust.
 
 ## Why Proxie?
 
@@ -104,7 +104,7 @@ Outputs platform-specific installers in `src-tauri/target/release/bundle/`:
 | Layer | Technology |
 |-------|-----------|
 | Desktop framework | Tauri v2 |
-| Frontend | React 18, TypeScript, MUI 7, Vite 6 |
+| Frontend | React 19, TypeScript, MUI 9, Vite 6 |
 | Backend | Rust, Tokio, Hyper |
 | TLS | rcgen (cert generation), rustls, tokio-rustls |
 | CI/CD | GitHub Actions (macOS, Windows, Linux) |

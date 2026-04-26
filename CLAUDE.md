@@ -2,11 +2,11 @@
 
 ## What is this project?
 
-Proxie is a lightweight HTTPS proxy interceptor desktop app (like Charles Proxy, but free and fast). Built with Tauri v2 (Rust) + React 18 + MUI 7.
+Proxie is a lightweight HTTPS proxy interceptor desktop app (like Charles Proxy, but free and fast). Built with Tauri v2 (Rust) + React 19 + MUI 9.
 
 ## Tech stack
 
-- **Frontend:** React 18, TypeScript, MUI 7, Vite 6, React Router 7
+- **Frontend:** React 19, TypeScript, MUI 9, Vite 6, React Router 7
 - **Backend:** Rust, Tauri v2, Tokio, Hyper, rcgen (cert generation)
 - **Tests:** Vitest + React Testing Library (frontend), cargo test (Rust)
 - **CI:** GitHub Actions on macOS ARM/Intel, Windows, Linux

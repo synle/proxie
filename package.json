@@ -1,6 +1,6 @@
 {
   "name": "proxie",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "A lightweight HTTPS proxy interceptor — like Charles Proxy, but free and fast",
   "scripts": {
     "dev": "vite",
