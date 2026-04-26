@@ -1,6 +1,6 @@
 {
   "name": "proxie",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A lightweight HTTPS proxy interceptor — like Charles Proxy, but free and fast",
   "scripts": {
     "dev": "vite",
@@ -16,17 +16,17 @@
     "@emotion/react": "^11.14.0",
     "@emotion/styled": "^11.14.0",
     "@tauri-apps/api": "^2",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "react-router-dom": "^7.5.0"
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5",
+    "react-router-dom": "^7.14.2"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@testing-library/user-event": "^14.6.1",
-    "@types/react": "^18.3.12",
-    "@types/react-dom": "^18.3.1",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^4.3.4",
     "jsdom": "^29.0.2",
     "prettier": "^3.8.2",
