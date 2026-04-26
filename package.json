@@ -1,6 +1,6 @@
 {
   "name": "proxie",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "A lightweight HTTPS proxy interceptor — like Charles Proxy, but free and fast",
   "scripts": {
     "dev": "vite",
@@ -11,8 +11,8 @@
     "tauri": "tauri"
   },
   "dependencies": {
-    "@mui/material": "^7.0.2",
-    "@mui/icons-material": "^7.0.2",
+    "@mui/material": "^9.0.0",
+    "@mui/icons-material": "^9.0.0",
     "@emotion/react": "^11.14.0",
     "@emotion/styled": "^11.14.0",
     "@tauri-apps/api": "^2",
