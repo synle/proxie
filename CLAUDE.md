@@ -73,6 +73,10 @@ src-tauri/src/                 # Rust backend
 - 4-platform matrix: macOS ARM, macOS Intel, Windows, Linux
 - PR builds post artifact download links as comments
 
+## Rust coverage gate
+
+The `coverage` job in `build.yml` runs `cargo llvm-cov --lib --summary-only` from `src-tauri/` on Linux and fails the build if lines / functions / regions drop below the v0.1.7 floored baseline (lines ≥ 37, functions ≥ 24, regions ≥ 38). HTML reports are uploaded as the `coverage-reports` artifact (14d retention) and the totals are appended to `$GITHUB_STEP_SUMMARY`. Raise these floors when coverage improves; never lower them.
+
 ## GitHub Raw File URLs
 
 When fetching raw file content from GitHub repos, always use the `?raw=1` blob URL format:
