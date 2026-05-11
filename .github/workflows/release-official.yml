@@ -29,12 +29,52 @@ jobs:
       tag: ${{ steps.pre.outputs.tag }}
       sha: ${{ steps.pre.outputs.sha }}
     steps:
+      - uses: actions/checkout@v4
+
+      # Guard: never let the release pipeline create a draft release
+      # with a bogus tag. We resolve the candidate tag in the same
+      # order `begin-release` does (explicit input → tag-ref push →
+      # version_file) and require it to match strict semver. If the
+      # check fails we abort BEFORE begin-release creates the draft
+      # so no cleanup is needed.
+      #
+      # Background — why this guard exists (2026-05-10):
+      # The earlier `version: ${{ inputs.tag || github.ref_name }}`
+      # fallback resolved to "main" on a workflow_dispatch from the
+      # default branch (no `tag` input), and the shared resolve-tag
+      # action then produced `vmain` as the release tag. The
+      # `vmain` release rolled three back-to-back v7.0.x dispatches
+      # into a single overwritten artifact on `display-dj`. The
+      # guard + the safer `version:` expression below together make
+      # this class of bug impossible to ship again.
+      - name: Validate resolved tag (fail fast)
+        run: |
+          set -euo pipefail
+          INPUT_TAG="${{ inputs.tag }}"
+          if [ -n "$INPUT_TAG" ]; then
+            CANDIDATE="${INPUT_TAG#v}"
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            CANDIDATE="${GITHUB_REF#refs/tags/v}"
+          else
+            CANDIDATE=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('src-tauri/tauri.conf.json','utf-8')).version)")
+          fi
+          if [[ ! "$CANDIDATE" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.]+)?$ ]]; then
+            {
+              echo "::error::Resolved release tag candidate 'v${CANDIDATE}' is not strict semver."
+              echo "::error::Source priority: inputs.tag → refs/tags/v* → src-tauri/tauri.conf.json#version."
+              echo "::error::Fix one of those before re-running the workflow."
+              echo "::error::This guard exists because a 'vmain' release was produced on 2026-05-10 by an unguarded fallback to github.ref_name."
+            } >&2
+            exit 1
+          fi
+          echo "Tag candidate is valid: v${CANDIDATE}"
+
       - uses: synle/workflows/actions/release/begin-release@main
         id: pre
         with:
           mode: official
           project_name: Proxie
-          version: ${{ inputs.tag || github.ref_name }}
+          version: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || '' }}
           version_file: src-tauri/tauri.conf.json
 
   build:
