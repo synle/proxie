@@ -29,7 +29,7 @@ jobs:
       tag: ${{ steps.pre.outputs.tag }}
       sha: ${{ steps.pre.outputs.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Guard: never let the release pipeline create a draft release
       # with a bogus tag. We resolve the candidate tag in the same
@@ -101,10 +101,10 @@ jobs:
     runs-on: ${{ matrix.platform }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 20
 
