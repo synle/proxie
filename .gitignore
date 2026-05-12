@@ -4,6 +4,9 @@ node_modules/
 # Build output
 dist/
 
+# Coverage reports
+coverage/
+
 # Rust / Tauri
 src-tauri/target/
 
