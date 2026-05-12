@@ -60,8 +60,21 @@ jobs:
       - name: Install dependencies
         run: npm ci || npm install --no-fund --prefer-offline
 
-      - name: Run frontend tests
-        run: npm test
+      - name: Run frontend tests (with coverage)
+        run: npm run test:coverage
+
+      # Upload FE coverage report on Linux only — coverage numbers don't
+      # vary across platforms, so one upload is enough. Scope to
+      # `coverage/` explicitly (rules 41/43) — never `.` or the full
+      # workspace.
+      - name: Upload frontend coverage report
+        if: matrix.platform == 'ubuntu-22.04' && always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: frontend-coverage
+          path: coverage/
+          retention-days: 14
+          if-no-files-found: ignore
 
       - name: Run Rust tests
         working-directory: src-tauri
@@ -176,6 +189,12 @@ jobs:
             echo
             echo "Thresholds (from \`build.yml\` cargo-llvm-cov flags):"
             echo "lines ≥ 37, functions ≥ 24, regions ≥ 38."
+            echo
+            echo "### Frontend (Vitest v8)"
+            echo
+            echo "Thresholds (from \`vite.config.ts\` \`test.coverage.thresholds\`):"
+            echo "lines ≥ 10, branches ≥ 8, functions ≥ 11, statements ≥ 10."
+            echo "(See the \`frontend-coverage\` artifact for the full HTML / lcov report.)"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # Post a comment on PRs with download links for each platform's build artifacts
