@@ -20,6 +20,7 @@ import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import StopIcon from '@mui/icons-material/Stop';
 import AltRouteIcon from '@mui/icons-material/AltRoute';
 import { invoke } from '@tauri-apps/api/core';
+import { buildTitle } from '../lib/version';
 
 const DRAWER_WIDTH = 220;
 
@@ -54,7 +55,7 @@ export default function Layout({ children }: { children: ReactNode }) {
       <AppBar position='fixed' sx={{ zIndex: (theme) => theme.zIndex.drawer + 1 }}>
         <Toolbar variant='dense'>
           <Typography variant='h6' noWrap sx={{ flexGrow: 1 }}>
-            Proxie
+            {buildTitle()}
           </Typography>
           <Chip
             label={proxyRunning ? 'Running' : 'Stopped'}

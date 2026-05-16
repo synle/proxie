@@ -86,6 +86,11 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Stamp the beta AppBar title with the short SHA so beta
+          # users can tell two same-version builds apart. Picked up
+          # by the Vite `define` block in `vite.config.ts`.
+          RELEASE_CHANNEL: beta
+          GIT_SHA: ${{ needs.prepare.outputs.sha || github.sha }}
         with:
           tagName: ${{ needs.prepare.outputs.tag }}
           releaseName: 'Proxie Beta (${{ needs.prepare.outputs.tag }})'

@@ -90,6 +90,11 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # CI builds (PRs + main pushes) are unreleased dev artifacts —
+          # the AppBar title falls back to the DEV format. Release
+          # workflows override these with `official` / `beta`.
+          RELEASE_CHANNEL: dev
+          GIT_SHA: ${{ github.sha }}
         with:
           args: --target ${{ matrix.target }}
 

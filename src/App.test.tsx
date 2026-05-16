@@ -5,8 +5,11 @@ import App from './App';
 describe('App', () => {
   it('renders without crashing', async () => {
     render(<App />);
+    // The AppBar title is the versioned build stamp (e.g.
+    // "Proxie DEV v0.0.0-test 2026-01-01") — match the channel-agnostic
+    // "Proxie" prefix so the assertion survives channel/version changes.
     await waitFor(() => {
-      expect(screen.getByText('Proxie')).toBeInTheDocument();
+      expect(screen.getByText(/^Proxie\b/)).toBeInTheDocument();
     });
   });
 
