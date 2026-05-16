@@ -21,7 +21,7 @@ proxie is a lightweight HTTPS proxy interceptor — a free, fast alternative to 
   - `src/components/` — shared UI (currently `Layout.tsx`, the app shell).
   - `src/test/` — Vitest setup and helpers.
 - `src-tauri/` — Rust Tauri backend (crate `proxie_lib`).
-  - `src-tauri/src/` — Rust source: `lib.rs` (Tauri command handlers + `run()` entrypoint), `proxy.rs` (TCP accept loop, MITM, intercept application), `cert.rs` (CA + leaf cert generation via `rcgen` and `rustls`), `state.rs` (`AppState`, persistence, mutexes, shutdown notify), `types.rs` (shared structs: `HostRule`, `InterceptRule`, `ConnectionLog`, `ProxyConfig`, `ProxyStatus`, `CertInfo`), `main.rs` (binary stub that calls `proxie_lib::run`).
+  - `src-tauri/src/` — Rust source: `lib.rs` (Tauri command handlers + `run()` entrypoint), `proxy.rs` (TCP accept loop, MITM, intercept application), `tls.rs` (MITM helpers: `load_ca`, `LeafCertCache`, `build_server_config`, `build_upstream_connector`), `cert.rs` (CA generation + platform install instructions), `state.rs` (`AppState`, persistence, mutexes, shutdown notify, lazy leaf-cert cache), `types.rs` (shared structs: `HostRule`, `InterceptRule`, `ConnectionLog`, `ProxyConfig`, `ProxyStatus`, `CertInfo`), `main.rs` (binary stub that calls `proxie_lib::run`).
   - `src-tauri/tests/` — Rust integration tests.
   - `src-tauri/icons/`, `src-tauri/gen/` — bundle icons and generated Tauri artifacts.
 - `.github/workflows/` — CI/CD pipelines (build + release + artifact cleanup).

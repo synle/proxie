@@ -13,7 +13,7 @@ Built with [Tauri v2](https://v2.tauri.app/) + React 19 + MUI 9 + Rust.
 
 ## Features
 
-- **HTTPS Interception** — Self-signed CA certificate generation with one-command install for macOS, Windows, and Linux
+- **HTTPS Interception** — Terminates TLS using per-host leaf certs signed by a locally-generated CA, then decrypts request/response into the live Connections view (Charles-style MITM). One-command install for macOS, Windows, and Linux; falls back to a transparent tunnel if the CA isn't trusted yet.
 - **Host Tracking** — Configure which hosts to monitor with wildcard support (`*.example.com`) and ignore paths (`/health`, `/metrics`)
 - **Live Connections** — Real-time traffic table with duration bars, status color coding, filtering, and request/response detail drawer
 - **Request Interceptor** — Mock responses (HAR format) or reroute requests to different targets, with access to request body/headers for dynamic behavior

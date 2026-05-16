@@ -1,7 +1,9 @@
 use crate::state::AppState;
+use crate::tls;
 use crate::types::{ConnectionLog, InterceptAction, ProxyStatus};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Start the HTTP/HTTPS proxy server.
 pub async fn start_proxy(
@@ -60,8 +62,6 @@ async fn handle_connection(
     state: Arc<AppState>,
     app_handle: AppHandle,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use tokio::io::AsyncReadExt;
-
     let mut buf = vec![0u8; 8192];
     let n = client_stream.read(&mut buf).await?;
     if n == 0 {
@@ -79,20 +79,20 @@ async fn handle_connection(
         return Ok(());
     }
 
-    let method = parts[0];
-    let target = parts[1];
+    let method = parts[0].to_string();
+    let target = parts[1].to_string();
 
     let start = std::time::Instant::now();
 
     if method == "CONNECT" {
-        // HTTPS tunnel: respond with 200 and relay bytes
-        handle_connect_tunnel(&mut client_stream, target, &state, &app_handle, start).await?;
+        // HTTPS tunnel: MITM if CA available, else blind relay.
+        handle_connect_tunnel(client_stream, &target, &state, &app_handle, start).await?;
     } else {
         // Plain HTTP: forward the request (or intercept)
         handle_http_request(
             &mut client_stream,
-            method,
-            target,
+            &method,
+            &target,
             request_data,
             &state,
             &app_handle,
@@ -106,37 +106,101 @@ async fn handle_connection(
     Ok(())
 }
 
+/// Handle a CONNECT tunnel from the client.
+///
+/// When the Proxie CA is available on disk we terminate TLS, read the
+/// decrypted HTTP request, optionally apply intercept rules, and forward to
+/// the real upstream over a fresh TLS connection — logging the full request
+/// and response into the [`ConnectionLog`] stream.
+///
+/// When the CA is missing we fall back to a transparent byte-relay so the
+/// proxy keeps working for users who haven't set up cert trust yet.
+///
+/// # Arguments
+/// * `client_stream` - Owned TCP stream from the client. Owned (not `&mut`)
+///   so we can hand it to a [`tokio_rustls::TlsAcceptor`].
+/// * `target` - `host:port` string from the CONNECT request line.
+/// * `state` - Shared app state (host rules, intercept rules, leaf cache).
+/// * `app_handle` - Tauri handle used to emit `proxy:connection` events.
+/// * `start` - Instant captured at the start of the request for timing.
+///
+/// # Errors
+/// Returns errors only for unrecoverable I/O failures — TLS handshake
+/// failures are caught and logged as warning entries in the connection
+/// stream, never bubbled up.
 async fn handle_connect_tunnel(
-    client_stream: &mut tokio::net::TcpStream,
+    client_stream: tokio::net::TcpStream,
     target: &str,
     state: &Arc<AppState>,
     app_handle: &AppHandle,
     start: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use tokio::io::AsyncWriteExt;
-
     let host_port: Vec<&str> = target.split(':').collect();
-    let host = host_port.first().unwrap_or(&"unknown");
-    let port = host_port.get(1).unwrap_or(&"443");
+    let host = host_port.first().copied().unwrap_or("unknown").to_string();
+    let port: u16 = host_port.get(1).and_then(|p| p.parse().ok()).unwrap_or(443);
 
-    // Check if this host is being tracked
+    // Check if this host is being tracked (purely informational for logs).
     let rules = state.get_host_rules().await.unwrap_or_default();
     let is_tracked = rules
         .iter()
-        .any(|r| r.enabled && host_matches(&r.host, host));
+        .any(|r| r.enabled && host_matches(&r.host, &host));
 
-    // Connect to the upstream server
+    // Try MITM if the CA is installed; otherwise fall back to blind relay.
+    let leaf_cache = state.get_or_init_leaf_cache().await;
+    match leaf_cache {
+        Some(cache) => {
+            mitm_connect(
+                client_stream,
+                &host,
+                port,
+                target,
+                cache,
+                state,
+                app_handle,
+                start,
+                is_tracked,
+            )
+            .await
+        }
+        None => {
+            blind_tunnel(
+                client_stream,
+                &host,
+                port,
+                target,
+                state,
+                app_handle,
+                start,
+                is_tracked,
+            )
+            .await
+        }
+    }
+}
+
+/// Blind CONNECT relay used when the Proxie CA isn't installed.
+///
+/// Logs a single CONNECT row noting MITM was skipped, then bridges bytes
+/// between client and upstream until either side hangs up.
+#[allow(clippy::too_many_arguments)]
+async fn blind_tunnel(
+    mut client_stream: tokio::net::TcpStream,
+    host: &str,
+    port: u16,
+    target: &str,
+    state: &Arc<AppState>,
+    app_handle: &AppHandle,
+    start: std::time::Instant,
+    is_tracked: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let upstream_addr = format!("{}:{}", host, port);
     let upstream = tokio::net::TcpStream::connect(&upstream_addr).await?;
 
-    // Send 200 Connection Established
     client_stream
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
 
     let duration_ms = start.elapsed().as_millis() as u64;
-
-    // Log the connection
     let conn = ConnectionLog {
         id: uuid::Uuid::new_v4().to_string(),
         method: "CONNECT".to_string(),
@@ -151,7 +215,10 @@ async fn handle_connect_tunnel(
         request_headers: vec![],
         response_headers: vec![],
         request_body: None,
-        response_body: None,
+        response_body: Some(
+            "MITM skipped — Proxie CA not installed. Generate and trust the CA in Setup to decrypt this connection."
+                .to_string(),
+        ),
         content_type: None,
         intercepted: false,
     };
@@ -159,10 +226,9 @@ async fn handle_connect_tunnel(
     let _ = app_handle.emit("proxy:connection", &conn);
 
     if is_tracked {
-        log::info!("Tracked CONNECT to {}", target);
+        log::info!("Tracked CONNECT (blind) to {}", target);
     }
 
-    // Relay bytes bidirectionally
     let (mut client_read, mut client_write) =
         tokio::io::split(tokio::io::BufReader::new(client_stream));
     let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
@@ -175,6 +241,527 @@ async fn handle_connect_tunnel(
     Ok(())
 }
 
+/// Full HTTPS MITM path — terminate client TLS, parse the decrypted request,
+/// optionally apply intercept rules, forward to upstream over a fresh TLS
+/// connection, log everything.
+#[allow(clippy::too_many_arguments)]
+async fn mitm_connect(
+    mut client_stream: tokio::net::TcpStream,
+    host: &str,
+    port: u16,
+    target: &str,
+    leaf_cache: Arc<crate::tls::LeafCertCache>,
+    state: &Arc<AppState>,
+    app_handle: &AppHandle,
+    start: std::time::Instant,
+    is_tracked: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Tell the client the tunnel is ready BEFORE we start the TLS handshake.
+    if let Err(e) = client_stream
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .await
+    {
+        log::warn!("CONNECT 200 write failed for {}: {}", target, e);
+        return Ok(());
+    }
+
+    // Mint / fetch the per-host ServerConfig and accept the TLS handshake.
+    let server_config = match leaf_cache.get_or_create(host).await {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            log_mitm_failure(
+                state,
+                app_handle,
+                host,
+                target,
+                start,
+                &format!("leaf cert generation failed: {}", e),
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+    let mut tls_client = match acceptor.accept(client_stream).await {
+        Ok(s) => s,
+        Err(e) => {
+            // Most common cause: client doesn't trust the CA.
+            log_mitm_failure(
+                state,
+                app_handle,
+                host,
+                target,
+                start,
+                &format!(
+                    "TLS handshake with client failed (is the Proxie CA trusted?): {}",
+                    e
+                ),
+            )
+            .await;
+            return Ok(());
+        }
+    };
+
+    if is_tracked {
+        log::info!("Tracked MITM CONNECT to {}", target);
+    }
+
+    // Read the first HTTP request from the decrypted stream.
+    let mut buf = vec![0u8; 16 * 1024];
+    let n = match tls_client.read(&mut buf).await {
+        Ok(0) => return Ok(()),
+        Ok(n) => n,
+        Err(e) => {
+            log_mitm_failure(
+                state,
+                app_handle,
+                host,
+                target,
+                start,
+                &format!("read decrypted request failed: {}", e),
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    let request_data = &buf[..n];
+    let request_str = String::from_utf8_lossy(request_data);
+
+    let first_line = request_str.lines().next().unwrap_or("");
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or("GET").to_string();
+    let path = parts.next().unwrap_or("/").to_string();
+
+    let request_headers: Vec<(String, String)> = request_str
+        .lines()
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| {
+            let mut p = line.splitn(2, ": ");
+            Some((p.next()?.to_string(), p.next()?.to_string()))
+        })
+        .collect();
+
+    let request_body = request_str
+        .find("\r\n\r\n")
+        .map(|idx| request_str[idx + 4..].to_string())
+        .filter(|s| !s.is_empty());
+
+    let url = format!("https://{}{}", host, path);
+
+    // Apply intercept rules on the decrypted request.
+    if let Some(rule) = state.find_intercept_rule(host, &path, &method).await {
+        return serve_intercept_over_tls(
+            &mut tls_client,
+            &method,
+            &url,
+            host,
+            &path,
+            &request_headers,
+            &request_body,
+            &rule.action,
+            state,
+            app_handle,
+            start,
+        )
+        .await;
+    }
+
+    // No rule — forward to real upstream over TLS.
+    let connector = match tls::build_upstream_connector() {
+        Ok(c) => c,
+        Err(e) => {
+            log_mitm_failure(
+                state,
+                app_handle,
+                host,
+                target,
+                start,
+                &format!("build upstream connector failed: {}", e),
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    let upstream_addr = format!("{}:{}", host, port);
+    let upstream_tcp = match tokio::net::TcpStream::connect(&upstream_addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            log_mitm_failure(
+                state,
+                app_handle,
+                host,
+                target,
+                start,
+                &format!("upstream TCP connect failed: {}", e),
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    let server_name = match rustls::pki_types::ServerName::try_from(host.to_string()) {
+        Ok(n) => n,
+        Err(e) => {
+            log_mitm_failure(
+                state,
+                app_handle,
+                host,
+                target,
+                start,
+                &format!("invalid upstream server name {}: {}", host, e),
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    let mut upstream_tls = match connector.connect(server_name, upstream_tcp).await {
+        Ok(s) => s,
+        Err(e) => {
+            log_mitm_failure(
+                state,
+                app_handle,
+                host,
+                target,
+                start,
+                &format!("upstream TLS handshake failed: {}", e),
+            )
+            .await;
+            return Ok(());
+        }
+    };
+
+    // Rewrite the request line so the path is absolute-form (already is for
+    // intercepted requests), and force Connection: close so the upstream
+    // doesn't keep the response open waiting for follow-ups.
+    let rewritten = rewrite_for_upstream(request_data, host);
+    if let Err(e) = upstream_tls.write_all(&rewritten).await {
+        log_mitm_failure(
+            state,
+            app_handle,
+            host,
+            target,
+            start,
+            &format!("upstream write failed: {}", e),
+        )
+        .await;
+        return Ok(());
+    }
+
+    // Read the full upstream response (header + body, bounded read loop).
+    let mut response_buf = Vec::with_capacity(8192);
+    let mut tmp = vec![0u8; 16 * 1024];
+    loop {
+        match upstream_tls.read(&mut tmp).await {
+            Ok(0) => break,
+            Ok(n) => response_buf.extend_from_slice(&tmp[..n]),
+            Err(_) => break,
+        }
+        if response_buf.len() > 8 * 1024 * 1024 {
+            // Cap at 8 MiB to avoid runaway memory on streaming responses.
+            break;
+        }
+    }
+
+    // Forward response to client.
+    let _ = tls_client.write_all(&response_buf).await;
+    let _ = tls_client.shutdown().await;
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    // Parse response status + headers + body for the connection log.
+    let (status, response_headers, response_body, content_type) = parse_response(&response_buf);
+
+    let conn = ConnectionLog {
+        id: uuid::Uuid::new_v4().to_string(),
+        method,
+        url,
+        host: host.to_string(),
+        path,
+        status,
+        duration_ms: Some(duration_ms),
+        request_size: Some(request_data.len() as u64),
+        response_size: Some(response_buf.len() as u64),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        request_headers,
+        response_headers,
+        request_body,
+        response_body,
+        content_type,
+        intercepted: false,
+    };
+    state.add_connection(conn.clone()).await;
+    let _ = app_handle.emit("proxy:connection", &conn);
+
+    Ok(())
+}
+
+/// Serve a mock/reroute response back over the terminated TLS stream.
+#[allow(clippy::too_many_arguments)]
+async fn serve_intercept_over_tls(
+    tls_client: &mut tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    method: &str,
+    url: &str,
+    host: &str,
+    path: &str,
+    request_headers: &[(String, String)],
+    request_body: &Option<String>,
+    action: &InterceptAction,
+    state: &Arc<AppState>,
+    app_handle: &AppHandle,
+    start: std::time::Instant,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match action {
+        InterceptAction::Mock { response } => {
+            let body = response.content.text.as_deref().unwrap_or("");
+            let body_bytes = body.as_bytes();
+
+            let mut resp = format!("HTTP/1.1 {} {}\r\n", response.status, response.status_text);
+            for h in &response.headers {
+                resp.push_str(&format!("{}: {}\r\n", h.name, h.value));
+            }
+            let has_cl = response
+                .headers
+                .iter()
+                .any(|h| h.name.eq_ignore_ascii_case("content-length"));
+            if !has_cl {
+                resp.push_str(&format!("Content-Length: {}\r\n", body_bytes.len()));
+            }
+            resp.push_str("Connection: close\r\n\r\n");
+
+            let mut full = resp.into_bytes();
+            full.extend_from_slice(body_bytes);
+            tls_client.write_all(&full).await?;
+            let _ = tls_client.shutdown().await;
+
+            let duration_ms = start.elapsed().as_millis() as u64;
+            let content_type = response
+                .headers
+                .iter()
+                .find(|h| h.name.eq_ignore_ascii_case("content-type"))
+                .map(|h| h.value.clone())
+                .unwrap_or_else(|| response.content.mime_type.clone());
+            let response_headers: Vec<(String, String)> = response
+                .headers
+                .iter()
+                .map(|h| (h.name.clone(), h.value.clone()))
+                .collect();
+
+            let conn = ConnectionLog {
+                id: uuid::Uuid::new_v4().to_string(),
+                method: method.to_string(),
+                url: url.to_string(),
+                host: host.to_string(),
+                path: path.to_string(),
+                status: Some(response.status),
+                duration_ms: Some(duration_ms),
+                request_size: None,
+                response_size: Some(full.len() as u64),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                request_headers: request_headers.to_vec(),
+                response_headers,
+                request_body: request_body.clone(),
+                response_body: Some(body.to_string()),
+                content_type: Some(content_type),
+                intercepted: true,
+            };
+            state.add_connection(conn.clone()).await;
+            let _ = app_handle.emit("proxy:connection", &conn);
+            log::info!(
+                "Intercepted HTTPS {} {} -> Mock {}",
+                method,
+                url,
+                response.status
+            );
+        }
+        InterceptAction::Reroute { target_url } => {
+            // For HTTPS reroute we go plain-HTTP/-HTTPS to the new target.
+            // The current implementation supports http(s):// reroute targets.
+            let reroute_host = extract_host(target_url, "");
+            let reroute_path = extract_path(target_url);
+            let is_https = target_url.starts_with("https://");
+            let reroute_port = extract_port(target_url).unwrap_or(if is_https { 443 } else { 80 });
+
+            let request_line = format!(
+                "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                method, reroute_path, reroute_host
+            );
+
+            let upstream_tcp =
+                tokio::net::TcpStream::connect((reroute_host.as_str(), reroute_port)).await?;
+            let response_buf = if is_https {
+                let connector = tls::build_upstream_connector()?;
+                let server_name = rustls::pki_types::ServerName::try_from(reroute_host.clone())?;
+                let mut upstream_tls = connector.connect(server_name, upstream_tcp).await?;
+                upstream_tls.write_all(request_line.as_bytes()).await?;
+                let mut buf = Vec::new();
+                let _ = upstream_tls.read_to_end(&mut buf).await;
+                buf
+            } else {
+                let mut s = upstream_tcp;
+                s.write_all(request_line.as_bytes()).await?;
+                let mut buf = Vec::new();
+                let _ = s.read_to_end(&mut buf).await;
+                buf
+            };
+
+            tls_client.write_all(&response_buf).await?;
+            let _ = tls_client.shutdown().await;
+
+            let (status, response_headers, _body, content_type) = parse_response(&response_buf);
+
+            let duration_ms = start.elapsed().as_millis() as u64;
+            let conn = ConnectionLog {
+                id: uuid::Uuid::new_v4().to_string(),
+                method: method.to_string(),
+                url: url.to_string(),
+                host: host.to_string(),
+                path: path.to_string(),
+                status,
+                duration_ms: Some(duration_ms),
+                request_size: None,
+                response_size: Some(response_buf.len() as u64),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                request_headers: request_headers.to_vec(),
+                response_headers,
+                request_body: request_body.clone(),
+                response_body: None,
+                content_type,
+                intercepted: true,
+            };
+            state.add_connection(conn.clone()).await;
+            let _ = app_handle.emit("proxy:connection", &conn);
+            log::info!(
+                "Intercepted HTTPS {} {} -> Reroute {}",
+                method,
+                url,
+                target_url
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Emit a warning-level ConnectionLog row for an MITM path failure.
+async fn log_mitm_failure(
+    state: &Arc<AppState>,
+    app_handle: &AppHandle,
+    host: &str,
+    target: &str,
+    start: std::time::Instant,
+    note: &str,
+) {
+    log::warn!("MITM failed for {}: {}", target, note);
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let conn = ConnectionLog {
+        id: uuid::Uuid::new_v4().to_string(),
+        method: "CONNECT".to_string(),
+        url: format!("https://{}", target),
+        host: host.to_string(),
+        path: "/".to_string(),
+        status: None,
+        duration_ms: Some(duration_ms),
+        request_size: None,
+        response_size: None,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        request_headers: vec![],
+        response_headers: vec![],
+        request_body: None,
+        response_body: Some(format!("MITM error: {}", note)),
+        content_type: None,
+        intercepted: false,
+    };
+    state.add_connection(conn.clone()).await;
+    let _ = app_handle.emit("proxy:connection", &conn);
+}
+
+/// Rewrite an inbound HTTP request to be safe for forwarding over an
+/// upstream TLS connection.
+///
+/// Specifically: forces `Connection: close` so we don't have to negotiate
+/// keep-alive on the upstream side. Leaves the request line and the rest of
+/// the headers untouched (origin-form `/path` is what the upstream expects
+/// anyway since the original request was over a CONNECT tunnel).
+pub fn rewrite_for_upstream(request_data: &[u8], host: &str) -> Vec<u8> {
+    let s = String::from_utf8_lossy(request_data).to_string();
+    let (head, body) = match s.find("\r\n\r\n") {
+        Some(idx) => (s[..idx].to_string(), s[idx + 4..].to_string()),
+        None => (s.clone(), String::new()),
+    };
+
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut saw_host = false;
+    let mut saw_conn = false;
+    for (i, line) in head.lines().enumerate() {
+        if i == 0 {
+            out_lines.push(line.to_string());
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("host:") {
+            saw_host = true;
+            out_lines.push(line.to_string());
+        } else if lower.starts_with("connection:") || lower.starts_with("proxy-connection:") {
+            saw_conn = true;
+            out_lines.push("Connection: close".to_string());
+        } else {
+            out_lines.push(line.to_string());
+        }
+    }
+    if !saw_host {
+        out_lines.insert(1, format!("Host: {}", host));
+    }
+    if !saw_conn {
+        out_lines.push("Connection: close".to_string());
+    }
+    let mut bytes = out_lines.join("\r\n").into_bytes();
+    bytes.extend_from_slice(b"\r\n\r\n");
+    bytes.extend_from_slice(body.as_bytes());
+    bytes
+}
+
+/// Parse a raw HTTP response byte buffer into the pieces we log.
+///
+/// # Returns
+/// `(status, headers, body_text, content_type)` — all optional fields
+/// fall back to `None` when the response can't be parsed (truncated, non-
+/// text body, etc).
+#[allow(clippy::type_complexity)]
+pub fn parse_response(
+    buf: &[u8],
+) -> (
+    Option<u16>,
+    Vec<(String, String)>,
+    Option<String>,
+    Option<String>,
+) {
+    let s = String::from_utf8_lossy(buf);
+    let header_end = s.find("\r\n\r\n");
+    let head = match header_end {
+        Some(idx) => &s[..idx],
+        None => &s[..],
+    };
+    let body = header_end.map(|idx| s[idx + 4..].to_string());
+
+    let mut lines = head.lines();
+    let status_line = lines.next().unwrap_or("");
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok());
+
+    let mut headers: Vec<(String, String)> = Vec::new();
+    let mut content_type: Option<String> = None;
+    for line in lines {
+        if let Some((k, v)) = line.split_once(": ") {
+            if k.eq_ignore_ascii_case("content-type") {
+                content_type = Some(v.to_string());
+            }
+            headers.push((k.to_string(), v.to_string()));
+        }
+    }
+    (status, headers, body, content_type)
+}
+
 async fn handle_http_request(
     client_stream: &mut tokio::net::TcpStream,
     method: &str,
@@ -184,8 +771,6 @@ async fn handle_http_request(
     app_handle: &AppHandle,
     start: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     // Parse host from URL or Host header
     let request_str = String::from_utf8_lossy(request_data);
     let host = extract_host(url, &request_str);
@@ -243,9 +828,7 @@ async fn handle_http_request(
             break;
         }
         response_buf.extend_from_slice(&tmp[..n]);
-        if response_buf.len() > 4
-            && response_buf.windows(4).any(|w| w == b"\r\n\r\n")
-        {
+        if response_buf.len() > 4 && response_buf.windows(4).any(|w| w == b"\r\n\r\n") {
             match tokio::time::timeout(
                 std::time::Duration::from_millis(100),
                 upstream.read(&mut tmp),
@@ -309,18 +892,13 @@ async fn handle_intercepted_request(
     app_handle: &AppHandle,
     start: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     match action {
         InterceptAction::Mock { response } => {
             // Build HTTP response from HAR response object
             let body = response.content.text.as_deref().unwrap_or("");
             let body_bytes = body.as_bytes();
 
-            let mut resp = format!(
-                "HTTP/1.1 {} {}\r\n",
-                response.status, response.status_text
-            );
+            let mut resp = format!("HTTP/1.1 {} {}\r\n", response.status, response.status_text);
 
             // Add HAR headers
             for header in &response.headers {
@@ -379,7 +957,12 @@ async fn handle_intercepted_request(
             state.add_connection(conn.clone()).await;
             let _ = app_handle.emit("proxy:connection", &conn);
 
-            log::info!("Intercepted {} {} -> Mock {} ", method, url, response.status);
+            log::info!(
+                "Intercepted {} {} -> Mock {} ",
+                method,
+                url,
+                response.status
+            );
         }
 
         InterceptAction::Reroute { target_url } => {
@@ -410,9 +993,7 @@ async fn handle_intercepted_request(
                     break;
                 }
                 response_buf.extend_from_slice(&tmp[..n]);
-                if response_buf.len() > 4
-                    && response_buf.windows(4).any(|w| w == b"\r\n\r\n")
-                {
+                if response_buf.len() > 4 && response_buf.windows(4).any(|w| w == b"\r\n\r\n") {
                     match tokio::time::timeout(
                         std::time::Duration::from_millis(100),
                         upstream.read(&mut tmp),
@@ -539,10 +1120,7 @@ pub fn build_mock_response(action: &InterceptAction) -> Option<Vec<u8>> {
             let body = response.content.text.as_deref().unwrap_or("");
             let body_bytes = body.as_bytes();
 
-            let mut resp = format!(
-                "HTTP/1.1 {} {}\r\n",
-                response.status, response.status_text
-            );
+            let mut resp = format!("HTTP/1.1 {} {}\r\n", response.status, response.status_text);
 
             for header in &response.headers {
                 resp.push_str(&format!("{}: {}\r\n", header.name, header.value));
@@ -728,5 +1306,62 @@ mod tests {
         let count = resp_str.matches("Content-Length").count();
         assert_eq!(count, 1);
         assert!(resp_str.contains("Content-Length: 42"));
+    }
+
+    #[test]
+    fn test_parse_response_basic() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}";
+        let (status, headers, body, ct) = parse_response(raw);
+        assert_eq!(status, Some(200));
+        assert!(headers.iter().any(|(k, _)| k == "Content-Type"));
+        assert_eq!(ct.as_deref(), Some("application/json"));
+        assert_eq!(body.as_deref(), Some("{\"ok\":true}"));
+    }
+
+    #[test]
+    fn test_parse_response_missing_body() {
+        let raw = b"HTTP/1.1 204 No Content\r\nX-Foo: bar\r\n\r\n";
+        let (status, headers, body, ct) = parse_response(raw);
+        assert_eq!(status, Some(204));
+        assert_eq!(headers.len(), 1);
+        assert_eq!(body.as_deref(), Some(""));
+        assert!(ct.is_none());
+    }
+
+    #[test]
+    fn test_parse_response_no_header_terminator() {
+        let raw = b"HTTP/1.1 500 Internal";
+        let (status, _headers, body, _ct) = parse_response(raw);
+        assert_eq!(status, Some(500));
+        assert!(body.is_none());
+    }
+
+    #[test]
+    fn test_rewrite_for_upstream_adds_connection_close() {
+        let req = b"GET /path HTTP/1.1\r\nHost: api.example.com\r\nAccept: */*\r\n\r\n";
+        let out = rewrite_for_upstream(req, "api.example.com");
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.starts_with("GET /path HTTP/1.1\r\n"));
+        assert!(s.contains("Host: api.example.com"));
+        assert!(s.contains("Connection: close"));
+    }
+
+    #[test]
+    fn test_rewrite_for_upstream_replaces_keep_alive() {
+        let req =
+            b"POST /api HTTP/1.1\r\nHost: api.example.com\r\nConnection: keep-alive\r\n\r\nbody";
+        let out = rewrite_for_upstream(req, "api.example.com");
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("Connection: close"));
+        assert!(!s.contains("keep-alive"));
+        assert!(s.ends_with("body"));
+    }
+
+    #[test]
+    fn test_rewrite_for_upstream_inserts_host_if_missing() {
+        let req = b"GET /path HTTP/1.1\r\nAccept: */*\r\n\r\n";
+        let out = rewrite_for_upstream(req, "fallback.example.com");
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("Host: fallback.example.com"));
     }
 }

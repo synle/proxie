@@ -1,4 +1,5 @@
 use crate::cert;
+use crate::tls::LeafCertCache;
 use crate::types::{CertInfo, ConnectionLog, HostRule, InterceptRule, ProxyConfig, ProxyStatus};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -30,10 +31,21 @@ pub struct AppState {
     connections: Mutex<Vec<ConnectionLog>>,
     proxy_status: Mutex<ProxyStatus>,
     shutdown_notify: Arc<Notify>,
+    /// Lazily-initialized per-host leaf cert cache for MITM TLS termination.
+    ///
+    /// `None` means the CA hasn't been generated/installed yet — the proxy
+    /// falls back to a blind tunnel in that case. The outer Mutex is locked
+    /// only during init and replacement (cheap); the inner `Arc<LeafCertCache>`
+    /// is what callers actually use.
+    leaf_cache: Mutex<Option<Arc<LeafCertCache>>>,
     _app_handle: AppHandle,
 }
 
 impl AppState {
+    /// Build a new AppState bound to the given Tauri AppHandle.
+    ///
+    /// # Arguments
+    /// * `app_handle` - Handle used by emitters / future Tauri-side helpers.
     pub fn new(app_handle: &AppHandle) -> Self {
         let persisted = Self::load_persisted_state();
         Self {
@@ -41,8 +53,44 @@ impl AppState {
             connections: Mutex::new(Vec::new()),
             proxy_status: Mutex::new(ProxyStatus::default()),
             shutdown_notify: Arc::new(Notify::new()),
+            leaf_cache: Mutex::new(None),
             _app_handle: app_handle.clone(),
         }
+    }
+
+    /// Fetch the leaf cert cache, lazily loading the CA from disk on the first
+    /// call. Returns `None` if the CA hasn't been generated yet (proxy then
+    /// falls back to a blind CONNECT tunnel).
+    ///
+    /// # Returns
+    /// `Some(Arc<LeafCertCache>)` if the CA loaded successfully, `None` if it
+    /// is missing or fails to parse. Errors are logged at warning level.
+    pub async fn get_or_init_leaf_cache(&self) -> Option<Arc<LeafCertCache>> {
+        let mut guard = self.leaf_cache.lock().await;
+        if let Some(c) = guard.as_ref() {
+            return Some(Arc::clone(c));
+        }
+        if !cert::ca_cert_path().exists() || !cert::ca_key_path().exists() {
+            return None;
+        }
+        match LeafCertCache::from_disk() {
+            Ok(cache) => {
+                let arc = Arc::new(cache);
+                *guard = Some(Arc::clone(&arc));
+                Some(arc)
+            }
+            Err(e) => {
+                log::warn!("failed to load Proxie CA for MITM: {}", e);
+                None
+            }
+        }
+    }
+
+    /// Invalidate the leaf cache (call after regenerating the CA so the
+    /// proxy re-reads the new key+cert).
+    pub async fn invalidate_leaf_cache(&self) {
+        let mut guard = self.leaf_cache.lock().await;
+        *guard = None;
     }
 
     fn config_path() -> PathBuf {
@@ -74,8 +122,13 @@ impl AppState {
     }
 
     // Certificate management
+
+    /// Generate a new Proxie CA on disk and invalidate any cached leaf certs
+    /// so subsequent connections pick up the new root.
     pub async fn generate_ca_cert(&self) -> Result<CertInfo, Box<dyn std::error::Error>> {
-        cert::generate_ca()
+        let info = cert::generate_ca()?;
+        self.invalidate_leaf_cache().await;
+        Ok(info)
     }
 
     pub async fn get_cert_info(&self) -> Result<Option<CertInfo>, Box<dyn std::error::Error>> {
