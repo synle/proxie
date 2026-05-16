@@ -83,6 +83,7 @@ jobs:
           if [[ "${{ matrix.platform }}" == "windows-latest" ]]; then
             cargo test --target ${{ matrix.target }} --lib
           else
+            # Runs lib + tests/ (integration: proxy_e2e.rs + smoke.rs)
             cargo test --target ${{ matrix.target }}
           fi
 
@@ -113,6 +114,51 @@ jobs:
           retention-days: 30
           compression-level: 9
           if-no-files-found: ignore
+
+  # Dedicated integration-tests job (Linux only). The matrix already runs
+  # `cargo test` on Linux/macOS, but pulling the integration suite into
+  # its own short job gives reviewers a single green check for the
+  # Tier 2 (`tests/proxy_e2e.rs`) + frontend integration coverage added
+  # in v0.4.2. Depends on `build` so a compile failure short-circuits
+  # this job rather than running redundantly.
+  integration-tests:
+    needs: [build]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libxdo-dev \
+            libssl-dev
+
+      - name: Install npm deps
+        run: npm ci || npm install --no-fund --prefer-offline
+
+      - name: Run Rust integration tests (tests/proxy_e2e.rs)
+        working-directory: src-tauri
+        # `cargo test --test '*'` runs every binary under `tests/` —
+        # currently `proxy_e2e.rs` (Tier 2 integration) and the
+        # existing `smoke.rs` placeholder. The `--lib` unit tests are
+        # already exercised by the main matrix above.
+        run: cargo test --test '*'
+
+      - name: Run frontend tests (includes src/test/integration/*.test.tsx)
+        run: npm run test -- --run
 
   coverage:
     # Coverage runs on a single OS (Linux is cheapest) — the numbers
@@ -146,18 +192,19 @@ jobs:
       - name: Rust coverage (cargo-llvm-cov)
         id: rust_cov
         working-directory: src-tauri
-        # Floors raised at v0.2.0 (HTTPS MITM) to lock in the
-        # Functions / Regions gains from the new tls.rs module +
-        # proxy.rs MITM path tests. Numbers observed on the v0.2.0
-        # squash commit (#10): Regions 40.65%, Functions 29.04%,
-        # Lines 37.47%. Floored to the nearest integer at-or-below
-        # the observed value. Raise these as coverage improves.
+        # Floors raised at v0.4.2 (test-coverage expansion) by +5pp
+        # across all three metrics to lock in the new Tier 1
+        # (proxy/tls/state edge cases) and Tier 2 (proxy_e2e.rs
+        # integration suite) gains. Previous v0.2.0 baseline:
+        # Regions ≥ 40, Functions ≥ 29, Lines ≥ 37. New v0.4.2
+        # baseline: Regions ≥ 45, Functions ≥ 34, Lines ≥ 42.
+        # Raise these as coverage improves; never lower.
         run: |
           set -o pipefail
           cargo llvm-cov --lib --summary-only \
-            --fail-under-lines 37 \
-            --fail-under-functions 29 \
-            --fail-under-regions 40 \
+            --fail-under-lines 42 \
+            --fail-under-functions 34 \
+            --fail-under-regions 45 \
             2>&1 | tee /tmp/rust-cov.txt
 
       # Upload the full HTML / lcov reports as an artifact so reviewers
@@ -196,7 +243,7 @@ jobs:
             echo '```'
             echo
             echo "Thresholds (from \`build.yml\` cargo-llvm-cov flags):"
-            echo "lines ≥ 37, functions ≥ 29, regions ≥ 40."
+            echo "lines ≥ 42, functions ≥ 34, regions ≥ 45."
             echo
             echo "### Frontend (Vitest v8)"
             echo
