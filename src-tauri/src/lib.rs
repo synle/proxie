@@ -1,6 +1,7 @@
 mod cert;
 mod proxy;
 mod state;
+mod tls;
 mod types;
 
 use state::AppState;
@@ -9,23 +10,17 @@ use tauri::Manager;
 use types::{CertInfo, ConnectionLog, HostRule, InterceptRule, ProxyConfig, ProxyStatus};
 
 #[tauri::command]
-async fn generate_cert(
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Result<CertInfo, String> {
+async fn generate_cert(state: tauri::State<'_, Arc<AppState>>) -> Result<CertInfo, String> {
     state.generate_ca_cert().await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn get_cert_info(
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Result<Option<CertInfo>, String> {
+async fn get_cert_info(state: tauri::State<'_, Arc<AppState>>) -> Result<Option<CertInfo>, String> {
     state.get_cert_info().await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn get_proxy_config(
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Result<ProxyConfig, String> {
+async fn get_proxy_config(state: tauri::State<'_, Arc<AppState>>) -> Result<ProxyConfig, String> {
     state.get_proxy_config().await.map_err(|e| e.to_string())
 }
 
@@ -41,9 +36,7 @@ async fn update_proxy_config(
 }
 
 #[tauri::command]
-async fn get_host_rules(
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Result<Vec<HostRule>, String> {
+async fn get_host_rules(state: tauri::State<'_, Arc<AppState>>) -> Result<Vec<HostRule>, String> {
     state.get_host_rules().await.map_err(|e| e.to_string())
 }
 
@@ -78,10 +71,7 @@ async fn delete_host_rule(
 async fn get_intercept_rules(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<Vec<InterceptRule>, String> {
-    state
-        .get_intercept_rules()
-        .await
-        .map_err(|e| e.to_string())
+    state.get_intercept_rules().await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -125,9 +115,7 @@ async fn get_connections(
 }
 
 #[tauri::command]
-async fn clear_connections(
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+async fn clear_connections(state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
     state.clear_connections().await.map_err(|e| e.to_string())
 }
 
@@ -143,16 +131,12 @@ async fn start_proxy(
 }
 
 #[tauri::command]
-async fn stop_proxy(
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Result<ProxyStatus, String> {
+async fn stop_proxy(state: tauri::State<'_, Arc<AppState>>) -> Result<ProxyStatus, String> {
     state.stop_proxy().await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn get_proxy_status(
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Result<ProxyStatus, String> {
+async fn get_proxy_status(state: tauri::State<'_, Arc<AppState>>) -> Result<ProxyStatus, String> {
     state.get_proxy_status().await.map_err(|e| e.to_string())
 }
 

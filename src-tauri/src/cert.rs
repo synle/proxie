@@ -31,11 +31,7 @@ pub fn generate_ca() -> Result<CertInfo, Box<dyn std::error::Error>> {
     // Valid for 10 years
     let now = chrono::Utc::now();
     let not_before = rcgen::date_time_ymd(now.format("%Y").to_string().parse()?, 1, 1);
-    let not_after = rcgen::date_time_ymd(
-        now.format("%Y").to_string().parse::<i32>()? + 10,
-        12,
-        31,
-    );
+    let not_after = rcgen::date_time_ymd(now.format("%Y").to_string().parse::<i32>()? + 10, 12, 31);
     params.not_before = not_before;
     params.not_after = not_after;
 
@@ -65,7 +61,10 @@ pub fn generate_ca() -> Result<CertInfo, Box<dyn std::error::Error>> {
         ca_key_path: ca_key_path().to_string_lossy().to_string(),
         fingerprint,
         created_at: now.format("%Y-%m-%d").to_string(),
-        expires_at: format!("{}-12-31", now.format("%Y").to_string().parse::<i32>()? + 10),
+        expires_at: format!(
+            "{}-12-31",
+            now.format("%Y").to_string().parse::<i32>()? + 10
+        ),
         install_instructions,
     })
 }
