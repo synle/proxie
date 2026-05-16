@@ -356,4 +356,76 @@ mod tests {
         // the tests run inside an OS image that has roots.
         let _connector = build_upstream_connector().expect("native roots load");
     }
+
+    // -------------------------------------------------------------------
+    // v0.4.2 expanded tls coverage — concurrent-mint race, multi-host
+    // cache identity, and SAN coverage beyond a single hostname.
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_leaf_cert_cache_concurrent_mints_share_arc() {
+        // Race two get_or_create calls for the same hostname — they must
+        // converge on the same Arc identity. The internal cache.entry
+        // lookup is what guarantees this; this test pins the contract.
+        let (ca, ca_pem) = make_test_ca();
+        let cache = Arc::new(LeafCertCache::new(ca, ca_pem));
+
+        let cache_a = Arc::clone(&cache);
+        let cache_b = Arc::clone(&cache);
+        let (a, b) = tokio::join!(
+            cache_a.get_or_create("race.example.com"),
+            cache_b.get_or_create("race.example.com"),
+        );
+        let a = a.unwrap();
+        let b = b.unwrap();
+        // Either the same Arc, or two distinct Arcs that point at
+        // equivalent ServerConfigs (the race winner's value stored, the
+        // loser dropped). The dispatcher pattern guarantees Arc::ptr_eq.
+        assert!(Arc::ptr_eq(&a, &b), "concurrent mints must share Arc");
+        assert_eq!(cache.len().await, 1);
+    }
+
+    #[test]
+    fn test_mint_leaf_cert_for_apex_and_subdomain() {
+        // Mint two leaves — one for the apex, one for a subdomain — and
+        // confirm each carries its own SAN. Catches accidental hostname
+        // sharing in the mint path.
+        let (ca, _ca_pem) = make_test_ca();
+        let (apex_pem, _) = mint_leaf_cert("example.com", &ca).unwrap();
+        let (sub_pem, _) = mint_leaf_cert("api.example.com", &ca).unwrap();
+
+        let apex = CertificateParams::from_ca_cert_pem(&apex_pem).unwrap();
+        let sub = CertificateParams::from_ca_cert_pem(&sub_pem).unwrap();
+        let apex_has = apex
+            .subject_alt_names
+            .iter()
+            .any(|s| matches!(s, SanType::DnsName(n) if n.as_ref() == "example.com"));
+        let sub_has = sub
+            .subject_alt_names
+            .iter()
+            .any(|s| matches!(s, SanType::DnsName(n) if n.as_ref() == "api.example.com"));
+        assert!(apex_has);
+        assert!(sub_has);
+    }
+
+    #[test]
+    fn test_mint_leaf_cert_accepts_unusual_but_legal_hostnames() {
+        // Hostnames containing hyphens / numeric labels are legal per
+        // RFC 1123 — make sure rcgen + our wrapper accept them.
+        let (ca, _ca_pem) = make_test_ca();
+        let (pem, _) = mint_leaf_cert("test-1.api.example.com", &ca).unwrap();
+        assert!(pem.contains("BEGIN CERTIFICATE"));
+    }
+
+    #[test]
+    fn test_build_server_config_rejects_mismatched_key() {
+        // Build a leaf cert from one CA, then try to pair it with a
+        // freshly-generated unrelated PKCS#8 key. rustls should refuse
+        // to build the ServerConfig because the public keys don't match.
+        let (ca, ca_pem) = make_test_ca();
+        let (leaf_pem, _leaf_key_pem) = mint_leaf_cert("mismatch.example.com", &ca).unwrap();
+        let bogus_key = KeyPair::generate().unwrap().serialize_pem();
+        let r = build_server_config(&leaf_pem, &bogus_key, &ca_pem);
+        assert!(r.is_err(), "mismatched key/cert must fail to build");
+    }
 }

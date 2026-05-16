@@ -647,4 +647,109 @@ mod tests {
         assert!(path.to_string_lossy().contains("proxie"));
         assert!(path.to_string_lossy().contains("config.json"));
     }
+
+    // -------------------------------------------------------------------
+    // v0.4.2 expanded coverage — block-rule and path-match edge cases
+    // plus PersistedState backward-compat probes that didn't exist before.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_path_matches_pattern_exact_root() {
+        // Root-only pattern matches root request path.
+        assert!(path_matches("/", "/"));
+        assert!(!path_matches("/", "/anything"));
+    }
+
+    #[test]
+    fn test_path_matches_empty_pattern_only_matches_empty_path() {
+        // An empty pattern is treated as a literal exact match — only the
+        // empty path satisfies it. This pins the "no wildcard, no special
+        // case" branch.
+        assert!(path_matches("", ""));
+        assert!(!path_matches("", "/"));
+    }
+
+    #[test]
+    fn test_path_matches_trailing_slash_star_only_anchors_prefix() {
+        // /api/* must match /api and /api/<anything> but NOT /api-extra.
+        assert!(path_matches("/api/*", "/api"));
+        assert!(path_matches("/api/*", "/api/foo"));
+        assert!(!path_matches("/api/*", "/api-extra"));
+    }
+
+    #[test]
+    fn test_persisted_state_default_block_rules_empty() {
+        // Default PersistedState carries no block rules.
+        let s = PersistedState::default();
+        assert!(s.block_rules.is_empty());
+        assert!(s.intercept_rules.is_empty());
+        assert!(s.host_rules.is_empty());
+    }
+
+    #[test]
+    fn test_persisted_state_round_trip_preserves_all_fields() {
+        // Full roundtrip — proxy_config + host_rules + intercept_rules +
+        // block_rules. Catches accidental serde rename / drop of a field.
+        let original = PersistedState {
+            proxy_config: ProxyConfig {
+                port: 12345,
+                listen_addr: "0.0.0.0".to_string(),
+                ssl_enabled: false,
+            },
+            host_rules: vec![HostRule {
+                id: "h1".to_string(),
+                host: "api.example.com".to_string(),
+                enabled: true,
+                ignore_paths: vec!["/health".to_string()],
+            }],
+            intercept_rules: vec![InterceptRule {
+                id: "ir1".to_string(),
+                name: "mock".to_string(),
+                enabled: true,
+                match_host: "api.example.com".to_string(),
+                match_path: "/foo".to_string(),
+                match_method: Some("GET".to_string()),
+                action: InterceptAction::Mock {
+                    response: HarResponse::default(),
+                },
+            }],
+            block_rules: vec![BlockRule {
+                id: "b1".to_string(),
+                host_pattern: "*.tracker.com".to_string(),
+                path_pattern: Some("/pixel/*".to_string()),
+                enabled: false,
+                note: "tracker".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let back: PersistedState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.proxy_config.port, 12345);
+        assert!(!back.proxy_config.ssl_enabled);
+        assert_eq!(back.host_rules.len(), 1);
+        assert_eq!(back.intercept_rules.len(), 1);
+        assert_eq!(back.block_rules.len(), 1);
+        assert_eq!(
+            back.block_rules[0].path_pattern.as_deref(),
+            Some("/pixel/*")
+        );
+    }
+
+    #[test]
+    fn test_block_rule_matches_path_pattern_star_all() {
+        // path_pattern = Some("*") should behave like the wildcard match
+        // — every path on the host matches.
+        let r = make_block_rule("api.example.com", Some("*"), true);
+        assert!(block_rule_matches(&r, "api.example.com", "/anywhere"));
+        assert!(block_rule_matches(&r, "api.example.com", "/"));
+        // Host still has to match.
+        assert!(!block_rule_matches(&r, "other.example.com", "/"));
+    }
+
+    #[test]
+    fn test_block_rule_matches_exact_path_pattern_rejects_prefix() {
+        // An exact `/login` path_pattern must NOT match `/login/admin`.
+        let r = make_block_rule("api.example.com", Some("/login"), true);
+        assert!(block_rule_matches(&r, "api.example.com", "/login"));
+        assert!(!block_rule_matches(&r, "api.example.com", "/login/admin"));
+    }
 }

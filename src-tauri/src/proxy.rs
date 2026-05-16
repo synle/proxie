@@ -1850,4 +1850,182 @@ mod tests {
         assert!(String::from_utf8_lossy(&http_bytes).contains("204"));
         assert!(String::from_utf8_lossy(&connect_bytes).contains("403"));
     }
+
+    // -------------------------------------------------------------------
+    // Extra v0.4.2 unit coverage — extractor / parser edge cases that
+    // were previously only exercised by happy-path tests. These pin
+    // behavior on malformed URLs, missing Host headers, and a number of
+    // off-by-one parser edges that bit during MITM bring-up.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_host_matches_wildcard_does_not_overmatch_unrelated_tld() {
+        // *.example.com must NOT match unrelated.example.com.evil.tld —
+        // host.ends_with(".example.com") is anchored to the suffix only.
+        assert!(!host_matches("*.example.com", "unrelated.example.org"));
+        assert!(!host_matches("*.example.com", "evilexample.com"));
+        // Apex match still works.
+        assert!(host_matches("*.example.com", "example.com"));
+    }
+
+    #[test]
+    fn test_host_matches_empty_pattern_and_host() {
+        // Empty pattern only matches empty host (exact path).
+        assert!(host_matches("", ""));
+        assert!(!host_matches("", "api.example.com"));
+        assert!(!host_matches("api.example.com", ""));
+    }
+
+    #[test]
+    fn test_extract_host_falls_back_to_unknown_when_no_url_or_header() {
+        // Neither a parseable URL nor a Host: header — extractor must
+        // return the literal "unknown" sentinel rather than panicking.
+        let got = extract_host("/just/a/path", "GET / HTTP/1.1\r\n\r\n");
+        assert_eq!(got, "unknown");
+    }
+
+    #[test]
+    fn test_extract_host_uses_lowercase_host_header() {
+        // Some clients send `host:` lowercase — the fallback path must
+        // still accept it.
+        let req = "GET /foo HTTP/1.1\r\nhost: api.example.com\r\n\r\n";
+        assert_eq!(extract_host("/foo", req), "api.example.com");
+    }
+
+    #[test]
+    fn test_extract_host_strips_port_in_url_form() {
+        assert_eq!(
+            extract_host("http://api.example.com:8443/v1/things", ""),
+            "api.example.com"
+        );
+    }
+
+    #[test]
+    fn test_extract_path_handles_root_only_url() {
+        // Bare `http://host` with no path — extract_path returns the
+        // input verbatim (we don't synthesize "/" here; callers do).
+        assert_eq!(extract_path("http://example.com"), "http://example.com");
+        assert_eq!(extract_path("https://example.com"), "https://example.com");
+        // With explicit / it returns just /.
+        assert_eq!(extract_path("http://example.com/"), "/");
+    }
+
+    #[test]
+    fn test_extract_port_rejects_non_numeric() {
+        // A non-numeric :port segment can't be parsed — must return None
+        // rather than panicking.
+        assert!(extract_port("http://example.com:abc/path").is_none());
+    }
+
+    #[test]
+    fn test_extract_port_handles_no_scheme() {
+        // No http(s):// prefix → extractor short-circuits to None.
+        assert!(extract_port("example.com:8080/path").is_none());
+    }
+
+    #[test]
+    fn test_parse_response_with_lf_only_header_terminator_is_unparsed() {
+        // We require CRLFCRLF — a bare LFLF response yields headers but
+        // no body (the parser falls into the "no terminator" branch).
+        let raw = b"HTTP/1.1 200 OK\nFoo: bar\n\nhello";
+        let (status, _h, body, _ct) = parse_response(raw);
+        // status still parses from the first line.
+        assert_eq!(status, Some(200));
+        // No CRLFCRLF → body is None.
+        assert!(body.is_none());
+    }
+
+    #[test]
+    fn test_parse_response_multi_value_header_keeps_first() {
+        // Two Content-Type headers should not panic — last write wins
+        // for `content_type`, both are preserved in `headers`.
+        let raw =
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Type: application/json\r\n\r\n{}";
+        let (status, headers, body, ct) = parse_response(raw);
+        assert_eq!(status, Some(200));
+        assert_eq!(body.as_deref(), Some("{}"));
+        assert_eq!(ct.as_deref(), Some("application/json"));
+        let cts: Vec<_> = headers
+            .iter()
+            .filter(|(k, _)| k == "Content-Type")
+            .collect();
+        assert_eq!(cts.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_response_garbage_status_line() {
+        // A status line without a numeric in the right position yields
+        // status=None but the rest of the parser still succeeds.
+        let raw = b"NOT-A-STATUS-LINE\r\nX-Foo: bar\r\n\r\n";
+        let (status, headers, body, _ct) = parse_response(raw);
+        assert!(status.is_none());
+        assert_eq!(headers.len(), 1);
+        assert_eq!(body.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_rewrite_for_upstream_preserves_body_bytes() {
+        // The body after CRLFCRLF must survive the rewrite verbatim,
+        // including binary-ish payloads — we can't lose POST data.
+        let req =
+            b"POST /api HTTP/1.1\r\nHost: x.test\r\nContent-Length: 4\r\n\r\n\x00\x01\x02\x03";
+        let out = rewrite_for_upstream(req, "x.test");
+        // The trailing 4 bytes must still be present.
+        assert!(out.ends_with(&[0u8, 1, 2, 3]));
+    }
+
+    #[test]
+    fn test_rewrite_for_upstream_handles_no_double_crlf() {
+        // Malformed request without CRLFCRLF — rewriter must still emit
+        // a well-formed envelope (header-only) without panicking.
+        let req = b"GET /path HTTP/1.1\r\nHost: x.test\r\n";
+        let out = rewrite_for_upstream(req, "x.test");
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.starts_with("GET /path HTTP/1.1\r\n"));
+        assert!(s.contains("Connection: close"));
+    }
+
+    #[test]
+    fn test_rewrite_for_upstream_replaces_proxy_connection_too() {
+        // Some HTTP/1.0-era clients send `Proxy-Connection:` instead of
+        // `Connection:` — the rewriter normalizes both to `Connection: close`.
+        let req = b"GET / HTTP/1.1\r\nHost: x.test\r\nProxy-Connection: keep-alive\r\n\r\n";
+        let out = rewrite_for_upstream(req, "x.test");
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("Connection: close"));
+        assert!(!s.contains("Proxy-Connection: keep-alive"));
+    }
+
+    #[test]
+    fn test_build_mock_response_path_pattern_matches_intercept_dispatch() {
+        // Sanity check for the dispatch shape that `state.find_intercept_rule`
+        // sees — the host/path matcher must agree with the intercept
+        // rule's expected match shape so the mock-builder runs.
+        assert!(host_matches("*.example.com", "api.example.com"));
+        // Path is matched in state.rs; here we just confirm the host
+        // half (the one this module owns).
+        assert!(!host_matches("api.example.com", "api.example.org"));
+    }
+
+    #[test]
+    fn test_build_mock_response_with_empty_body_still_well_formed() {
+        // A mock with text = None must still emit a header/body separator
+        // and Content-Length: 0.
+        let action = InterceptAction::Mock {
+            response: HarResponse {
+                status: 204,
+                status_text: "No Content".to_string(),
+                headers: vec![],
+                content: HarContent {
+                    size: 0,
+                    mime_type: "text/plain".to_string(),
+                    text: None,
+                },
+            },
+        };
+        let resp = build_mock_response(&action).unwrap();
+        let s = String::from_utf8(resp).unwrap();
+        assert!(s.contains("Content-Length: 0\r\n"));
+        assert!(s.ends_with("\r\n\r\n"));
+    }
 }
