@@ -1,8 +1,12 @@
-mod cert;
-mod proxy;
-mod state;
-mod tls;
-mod types;
+// Modules are `pub` so they can be exercised by integration tests under
+// `tests/`. The Tauri command surface (`#[tauri::command]` fns below)
+// remains the primary frontend-facing API; the `pub` mods are
+// considered an internal-test-only export.
+pub mod cert;
+pub mod proxy;
+pub mod state;
+pub mod tls;
+pub mod types;
 
 use state::AppState;
 use std::sync::Arc;
