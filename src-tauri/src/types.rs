@@ -27,7 +27,7 @@ pub struct ProxyConfig {
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
-            port: 8899,
+            port: 39871,
             listen_addr: "127.0.0.1".to_string(),
             ssl_enabled: true,
         }
@@ -183,7 +183,7 @@ mod tests {
     #[test]
     fn test_proxy_config_default() {
         let config = ProxyConfig::default();
-        assert_eq!(config.port, 8899);
+        assert_eq!(config.port, 39871);
         assert_eq!(config.listen_addr, "127.0.0.1");
         assert!(config.ssl_enabled);
     }

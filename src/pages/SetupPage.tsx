@@ -38,7 +38,7 @@ interface ProxyConfig {
 export default function SetupPage() {
   const [certInfo, setCertInfo] = useState<CertInfo | null>(null);
   const [config, setConfig] = useState<ProxyConfig>({
-    port: 8899,
+    port: 39871,
     listen_addr: '127.0.0.1',
     ssl_enabled: true,
   });

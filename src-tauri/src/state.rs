@@ -540,7 +540,7 @@ mod tests {
     #[test]
     fn test_persisted_state_default() {
         let state = PersistedState::default();
-        assert_eq!(state.proxy_config.port, 8899);
+        assert_eq!(state.proxy_config.port, 39871);
         assert!(state.host_rules.is_empty());
     }
 

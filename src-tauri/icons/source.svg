@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1e1b4b"/>
+      <stop offset="1" stop-color="#4c1d95"/>
+    </linearGradient>
+    <linearGradient id="bar" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#06b6d4"/>
+      <stop offset="1" stop-color="#10b981"/>
+    </linearGradient>
+    <linearGradient id="arrow" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#fbbf24"/>
+      <stop offset="1" stop-color="#f97316"/>
+    </linearGradient>
+  </defs>
+  <!-- rounded-square background -->
+  <rect x="0" y="0" width="1024" height="1024" rx="200" ry="200" fill="url(#bg)"/>
+  <!-- 4 ascending signal bars, centered -->
+  <g fill="url(#bar)">
+    <rect x="220" y="640" width="110" height="180" rx="24"/>
+    <rect x="370" y="520" width="110" height="300" rx="24"/>
+    <rect x="520" y="380" width="110" height="440" rx="24"/>
+    <rect x="670" y="220" width="110" height="600" rx="24"/>
+  </g>
+  <!-- interception arrow piercing the bars, slight downward tilt -->
+  <g stroke="url(#arrow)" stroke-width="44" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M120 470 L 880 540"/>
+    <path d="M820 480 L 880 540 L 820 600"/>
+  </g>
+</svg>

@@ -240,7 +240,7 @@ mod tests {
     #[test]
     fn test_proxy_config_defaults() {
         let config = ProxyConfig::default();
-        assert_eq!(config.port, 8899);
+        assert_eq!(config.port, 39871);
         assert_eq!(config.listen_addr, "127.0.0.1");
     }
 }

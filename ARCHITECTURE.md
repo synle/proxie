@@ -10,7 +10,7 @@ proxie is a lightweight HTTPS proxy interceptor — a free, fast alternative to 
 
 1. On first run, the user generates a CA certificate (`generate_cert`) and trusts it on the host OS.
 2. The user configures host rules (which hosts to intercept) and intercept rules (request/response modifications) via the React UI.
-3. The user calls `start_proxy`, which binds a `tokio::net::TcpListener` on the configured `listen_addr:port` (default `127.0.0.1:8899`) and spawns an accept loop.
+3. The user calls `start_proxy`, which binds a `tokio::net::TcpListener` on the configured `listen_addr:port` (default `127.0.0.1:39871`) and spawns an accept loop.
 4. For each connection, the proxy parses the request, decides MITM vs. tunnel based on host rules, generates a per-host leaf cert signed by the CA when terminating TLS, applies intercept rules, forwards upstream, and emits a `ConnectionLog` event to the frontend via `tauri::Emitter`.
 5. The Connections page subscribes to these events and renders the live request/response stream.
 

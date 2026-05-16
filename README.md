@@ -89,24 +89,24 @@ Outputs platform-specific installers in `src-tauri/target/release/bundle/`:
 4. Point your system or browser at the proxy. **You must enable BOTH HTTP and HTTPS** — turning on only "Web proxy (HTTP)" will silently miss every HTTPS site (which is nearly all modern traffic).
 
    **macOS** (System Settings → Network → your interface → Details → Proxies):
-   - Enable **Web proxy (HTTP)** → `127.0.0.1` port `8899`
-   - Enable **Secure web proxy (HTTPS)** → `127.0.0.1` port `8899`
+   - Enable **Web proxy (HTTP)** → `127.0.0.1` port `39871`
+   - Enable **Secure web proxy (HTTPS)** → `127.0.0.1` port `39871`
    - Click **OK** to apply
 
    **Windows 10/11** (Settings → Network & Internet → Proxy → Manual proxy setup):
    - Toggle **Use a proxy server** ON
-   - Address `127.0.0.1`, Port `8899` (this single setting covers both HTTP and HTTPS)
+   - Address `127.0.0.1`, Port `39871` (this single setting covers both HTTP and HTTPS)
    - Click **Save**
-   - Per-app override (PowerShell): `$env:HTTP_PROXY="http://127.0.0.1:8899"; $env:HTTPS_PROXY="http://127.0.0.1:8899"`
+   - Per-app override (PowerShell): `$env:HTTP_PROXY="http://127.0.0.1:39871"; $env:HTTPS_PROXY="http://127.0.0.1:39871"`
 
    **Linux:**
-   - GNOME: Settings → Network → Network Proxy → Manual → set HTTP and HTTPS proxy to `127.0.0.1:8899`
-   - Shell-only: `export HTTP_PROXY=http://127.0.0.1:8899 HTTPS_PROXY=http://127.0.0.1:8899`
+   - GNOME: Settings → Network → Network Proxy → Manual → set HTTP and HTTPS proxy to `127.0.0.1:39871`
+   - Shell-only: `export HTTP_PROXY=http://127.0.0.1:39871 HTTPS_PROXY=http://127.0.0.1:39871`
 
    **Shell (any OS):**
    ```bash
-   export HTTP_PROXY=http://127.0.0.1:8899
-   export HTTPS_PROXY=http://127.0.0.1:8899
+   export HTTP_PROXY=http://127.0.0.1:39871
+   export HTTPS_PROXY=http://127.0.0.1:39871
    ```
 
    **Firefox** uses its own proxy settings — set them in Settings → Network Settings on every platform.
@@ -120,7 +120,7 @@ Outputs platform-specific installers in `src-tauri/target/release/bundle/`:
 ### Verify
 
 ```bash
-curl -x http://127.0.0.1:8899 https://example.com -v
+curl -x http://127.0.0.1:39871 https://example.com -v
 ```
 The request should appear in the **Connections** page. If `curl` fails with a TLS error, the CA cert isn't trusted yet — re-run the trust command in step 3.
 
@@ -131,7 +131,7 @@ The request should appear in the **Connections** page. If `curl` fails with a TL
   - Windows: the proxy toggle didn't save — re-open Settings and confirm **Use a proxy server** is still on.
   - All platforms: browsers cache connections; visit a fresh tab or restart the browser after changing settings.
 - **TLS / cert errors in browser:** CA cert isn't trusted — re-run the platform install command, then fully quit and relaunch the browser. On Windows, run the `certutil` command in an **elevated** PowerShell or Command Prompt.
-- **Port 8899 in use:** Change the port on the **Setup** page and update the system proxy to match.
+- **Port 39871 in use:** Change the port on the **Setup** page and update the system proxy to match.
 - **Chrome on Windows ignores the CA:** Chrome reads the Windows ROOT store via `certutil -addstore "ROOT"`, but if you installed into the Current User store instead it won't be trusted system-wide — re-run with the `-addstore` form (not `-user`).
 - **`curl` works but the browser doesn't:** the browser is bypassing the system proxy (Firefox does this by default; Chrome may have `--proxy-server` flag overrides). Check the browser's own network settings.
 
