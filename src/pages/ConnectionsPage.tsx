@@ -185,7 +185,24 @@ export default function ConnectionsPage() {
                   onClick={() => setSelected(conn)}
                   sx={{ cursor: 'pointer' }}>
                   <TableCell>
-                    <Chip label={conn.method} size='small' variant='outlined' />
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                      <Chip label={conn.method} size='small' variant='outlined' />
+                      {conn.intercepted && (
+                        <Tooltip title='Response served by an intercept rule (mock or reroute)'>
+                          <Chip
+                            label='INTERCEPTED'
+                            size='small'
+                            color='secondary'
+                            data-testid='intercepted-badge'
+                            sx={{
+                              fontSize: '0.65rem',
+                              height: 18,
+                              '& .MuiChip-label': { px: 0.75 },
+                            }}
+                          />
+                        </Tooltip>
+                      )}
+                    </Box>
                   </TableCell>
                   <TableCell
                     sx={{
@@ -245,6 +262,11 @@ export default function ConnectionsPage() {
             <Typography variant='subtitle2' sx={{ mt: 2, mb: 1 }}>
               General
             </Typography>
+            <DetailRow
+              label='Intercepted'
+              value={selected.intercepted ? 'yes' : 'no'}
+              highlight={selected.intercepted}
+            />
             <DetailRow label='URL' value={selected.url} />
             <DetailRow label='Host' value={selected.host} />
             <DetailRow label='Duration' value={formatDuration(selected.duration_ms)} />
@@ -311,15 +333,46 @@ export default function ConnectionsPage() {
   );
 }
 
-function DetailRow({ label, value }: { label: string; value: string }) {
+/**
+ * Render a label / value row in the connection detail drawer.
+ *
+ * @param label - Field label shown in the gutter.
+ * @param value - Field value rendered in monospace.
+ * @param highlight - When true, paints a warning-tinted background so the row
+ *   stands out (used for the "Intercepted: yes" indicator).
+ */
+function DetailRow({
+  label,
+  value,
+  highlight = false,
+}: {
+  label: string;
+  value: string;
+  highlight?: boolean;
+}) {
   return (
-    <Box sx={{ display: 'flex', py: 0.5, borderBottom: '1px solid', borderColor: 'divider' }}>
+    <Box
+      data-testid={highlight ? 'detail-row-highlighted' : undefined}
+      sx={{
+        display: 'flex',
+        py: 0.5,
+        borderBottom: '1px solid',
+        borderColor: 'divider',
+        bgcolor: highlight ? 'warning.dark' : 'transparent',
+        px: highlight ? 1 : 0,
+        borderRadius: highlight ? 1 : 0,
+      }}>
       <Typography variant='caption' sx={{ width: 120, flexShrink: 0, color: 'text.secondary' }}>
         {label}
       </Typography>
       <Typography
         variant='caption'
-        sx={{ wordBreak: 'break-all', fontFamily: 'monospace', fontSize: '0.8em' }}>
+        sx={{
+          wordBreak: 'break-all',
+          fontFamily: 'monospace',
+          fontSize: '0.8em',
+          fontWeight: highlight ? 600 : 400,
+        }}>
         {value}
       </Typography>
     </Box>
