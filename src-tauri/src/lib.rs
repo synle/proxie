@@ -7,7 +7,9 @@ mod types;
 use state::AppState;
 use std::sync::Arc;
 use tauri::Manager;
-use types::{CertInfo, ConnectionLog, HostRule, InterceptRule, ProxyConfig, ProxyStatus};
+use types::{
+    BlockRule, CertInfo, ConnectionLog, HostRule, InterceptRule, ProxyConfig, ProxyStatus,
+};
 
 #[tauri::command]
 async fn generate_cert(state: tauri::State<'_, Arc<AppState>>) -> Result<CertInfo, String> {
@@ -107,6 +109,45 @@ async fn delete_intercept_rule(
         .map_err(|e| e.to_string())
 }
 
+/// Return every persisted [`BlockRule`].
+#[tauri::command]
+async fn get_block_rules(state: tauri::State<'_, Arc<AppState>>) -> Result<Vec<BlockRule>, String> {
+    state.get_block_rules().await.map_err(|e| e.to_string())
+}
+
+/// Insert a new block rule. Frontend supplies a UUID for `id`.
+#[tauri::command]
+async fn add_block_rule(
+    state: tauri::State<'_, Arc<AppState>>,
+    rule: BlockRule,
+) -> Result<Vec<BlockRule>, String> {
+    state.add_block_rule(rule).await.map_err(|e| e.to_string())
+}
+
+/// Replace an existing block rule (matched by id).
+#[tauri::command]
+async fn update_block_rule(
+    state: tauri::State<'_, Arc<AppState>>,
+    rule: BlockRule,
+) -> Result<Vec<BlockRule>, String> {
+    state
+        .update_block_rule(rule)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Delete the block rule with the given id (no-op if it does not exist).
+#[tauri::command]
+async fn delete_block_rule(
+    state: tauri::State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<Vec<BlockRule>, String> {
+    state
+        .delete_block_rule(&id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn get_connections(
     state: tauri::State<'_, Arc<AppState>>,
@@ -163,6 +204,10 @@ pub fn run() {
             add_intercept_rule,
             update_intercept_rule,
             delete_intercept_rule,
+            get_block_rules,
+            add_block_rule,
+            update_block_rule,
+            delete_block_rule,
             get_connections,
             clear_connections,
             start_proxy,

@@ -5,6 +5,7 @@ import SetupPage from './pages/SetupPage';
 import HostRulesPage from './pages/HostRulesPage';
 import ConnectionsPage from './pages/ConnectionsPage';
 import InterceptorPage from './pages/InterceptorPage';
+import BlockRulesPage from './pages/BlockRulesPage';
 
 const darkTheme = createTheme({
   palette: {
@@ -30,6 +31,7 @@ export default function App() {
             <Route path='/hosts' element={<HostRulesPage />} />
             <Route path='/connections' element={<ConnectionsPage />} />
             <Route path='/interceptor' element={<InterceptorPage />} />
+            <Route path='/blocks' element={<BlockRulesPage />} />
             <Route path='*' element={<Navigate to='/connections' replace />} />
           </Routes>
         </Layout>

@@ -1,6 +1,8 @@
 use crate::cert;
 use crate::tls::LeafCertCache;
-use crate::types::{CertInfo, ConnectionLog, HostRule, InterceptRule, ProxyConfig, ProxyStatus};
+use crate::types::{
+    BlockRule, CertInfo, ConnectionLog, HostRule, InterceptRule, ProxyConfig, ProxyStatus,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,6 +16,9 @@ struct PersistedState {
     host_rules: Vec<HostRule>,
     #[serde(default)]
     intercept_rules: Vec<InterceptRule>,
+    /// Pi-hole style host/path blockers. Added in v0.4.0.
+    #[serde(default)]
+    block_rules: Vec<BlockRule>,
 }
 
 impl Default for PersistedState {
@@ -22,6 +27,7 @@ impl Default for PersistedState {
             proxy_config: ProxyConfig::default(),
             host_rules: Vec::new(),
             intercept_rules: Vec::new(),
+            block_rules: Vec::new(),
         }
     }
 }
@@ -242,6 +248,100 @@ impl AppState {
         self.get_intercept_rules().await
     }
 
+    // Block rules (Pi-hole style host/path blockers — added v0.4.0).
+
+    /// Return every persisted block rule (enabled and disabled).
+    ///
+    /// # Returns
+    /// A cloned vector so the caller doesn't hold the persisted-state lock
+    /// past the call.
+    pub async fn get_block_rules(&self) -> Result<Vec<BlockRule>, Box<dyn std::error::Error>> {
+        let state = self.persisted.lock().await;
+        Ok(state.block_rules.clone())
+    }
+
+    /// Insert a new block rule and persist the change.
+    ///
+    /// # Arguments
+    /// * `rule` - Caller-supplied [`BlockRule`]. `host_pattern` must be
+    ///   non-empty after trimming (rule 21 — validate input shape).
+    ///
+    /// # Errors
+    /// Returns an error string when `host_pattern` is empty/whitespace, or
+    /// when the on-disk save fails.
+    pub async fn add_block_rule(
+        &self,
+        rule: BlockRule,
+    ) -> Result<Vec<BlockRule>, Box<dyn std::error::Error>> {
+        if rule.host_pattern.trim().is_empty() {
+            return Err("host_pattern must be non-empty".into());
+        }
+        {
+            let mut state = self.persisted.lock().await;
+            state.block_rules.push(rule);
+        }
+        self.save().await?;
+        self.get_block_rules().await
+    }
+
+    /// Replace an existing block rule (matched by id) in-place. No-op when
+    /// no rule with the given id exists.
+    pub async fn update_block_rule(
+        &self,
+        rule: BlockRule,
+    ) -> Result<Vec<BlockRule>, Box<dyn std::error::Error>> {
+        if rule.host_pattern.trim().is_empty() {
+            return Err("host_pattern must be non-empty".into());
+        }
+        {
+            let mut state = self.persisted.lock().await;
+            if let Some(existing) = state.block_rules.iter_mut().find(|r| r.id == rule.id) {
+                *existing = rule;
+            }
+        }
+        self.save().await?;
+        self.get_block_rules().await
+    }
+
+    /// Remove the block rule whose `id` matches and persist.
+    pub async fn delete_block_rule(
+        &self,
+        id: &str,
+    ) -> Result<Vec<BlockRule>, Box<dyn std::error::Error>> {
+        {
+            let mut state = self.persisted.lock().await;
+            state.block_rules.retain(|r| r.id != id);
+        }
+        self.save().await?;
+        self.get_block_rules().await
+    }
+
+    /// Find the first enabled block rule that matches `host` and `path`.
+    ///
+    /// Host matches use the shared [`crate::proxy::host_matches`] helper so
+    /// wildcard patterns (`*.example.com`) work identically to host-tracking
+    /// rules. If a rule has `path_pattern: Some(p)`, the path is checked
+    /// against `p` via [`path_matches`]; when `path_pattern` is `None`, every
+    /// path on the matched host is treated as blocked.
+    ///
+    /// # Arguments
+    /// * `host` - Request host (e.g. `ads.doubleclick.net`).
+    /// * `path` - Origin-form request path. For CONNECT pre-checks, callers
+    ///   pass `"/"`, so host-only rules still match before any upstream
+    ///   socket is opened.
+    ///
+    /// # Returns
+    /// `Some(rule)` for the first enabled match in insertion order, `None`
+    /// when nothing matches or the rule is disabled.
+    pub async fn find_block_rule(&self, host: &str, path: &str) -> Option<BlockRule> {
+        let state = self.persisted.lock().await;
+        state
+            .block_rules
+            .iter()
+            .find(|r| block_rule_matches(r, host, path))
+            .cloned()
+    }
+
     /// Find a matching intercept rule for a given request.
     pub async fn find_intercept_rule(
         &self,
@@ -323,9 +423,43 @@ impl AppState {
 }
 
 /// Match a path pattern against a request path.
-/// Supports wildcard suffix (e.g., "/api/*" matches "/api/users", "/api/users/1").
-/// Exact match without wildcard.
-fn path_matches(pattern: &str, path: &str) -> bool {
+///
+/// Supports a trailing `/*` (matches the prefix or any deeper segment) and a
+/// generic trailing `*` (prefix-only). A literal `*` matches every path.
+/// Without a wildcard, the pattern must match the path exactly.
+///
+/// # Arguments
+/// * `pattern` - Path pattern from a rule (e.g. `/api/*`, `/api/v*`, `/health`).
+/// * `path` - The request path being checked (e.g. `/api/users/1`).
+///
+/// # Returns
+/// `true` when `path` matches `pattern` under the rules above.
+/// Pure predicate used by [`AppState::find_block_rule`]. Extracted into a
+/// free function so tests can exercise the matching logic without spinning
+/// up an [`AppState`] (which depends on a Tauri `AppHandle`).
+///
+/// # Arguments
+/// * `rule` - Candidate block rule.
+/// * `host` - Request host being checked.
+/// * `path` - Request path (`"/"` for CONNECT pre-checks).
+///
+/// # Returns
+/// `true` when the rule is enabled, its host pattern matches `host`, and
+/// either it has no path pattern or the path pattern matches `path`.
+fn block_rule_matches(rule: &BlockRule, host: &str, path: &str) -> bool {
+    if !rule.enabled {
+        return false;
+    }
+    if !crate::proxy::host_matches(&rule.host_pattern, host) {
+        return false;
+    }
+    match &rule.path_pattern {
+        Some(p) => path_matches(p, path),
+        None => true,
+    }
+}
+
+pub(crate) fn path_matches(pattern: &str, path: &str) -> bool {
     if pattern == "*" {
         return true;
     }
@@ -387,6 +521,7 @@ mod tests {
                     response: HarResponse::default(),
                 },
             }],
+            block_rules: vec![],
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: PersistedState = serde_json::from_str(&json).unwrap();
@@ -424,11 +559,86 @@ mod tests {
                 ignore_paths: vec![],
             }],
             intercept_rules: vec![],
+            block_rules: vec![BlockRule {
+                id: "b1".to_string(),
+                host_pattern: "*.doubleclick.net".to_string(),
+                path_pattern: None,
+                enabled: true,
+                note: "ads".to_string(),
+            }],
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: PersistedState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.proxy_config.port, 9000);
         assert_eq!(back.host_rules.len(), 1);
+        assert_eq!(back.block_rules.len(), 1);
+    }
+
+    #[test]
+    fn test_persisted_state_backward_compat_no_block_rules() {
+        // A pre-v0.4.0 config (no block_rules field) must still deserialize
+        // and produce an empty block_rules vector.
+        let json = r#"{"proxy_config":{"port":8899,"listen_addr":"127.0.0.1","ssl_enabled":true},"host_rules":[],"intercept_rules":[]}"#;
+        let state: PersistedState = serde_json::from_str(json).unwrap();
+        assert!(state.block_rules.is_empty());
+    }
+
+    fn make_block_rule(host: &str, path: Option<&str>, enabled: bool) -> BlockRule {
+        BlockRule {
+            id: format!("br-{}", host),
+            host_pattern: host.to_string(),
+            path_pattern: path.map(|s| s.to_string()),
+            enabled,
+            note: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_block_rule_matches_exact_host_no_path() {
+        let r = make_block_rule("ads.example.com", None, true);
+        assert!(block_rule_matches(&r, "ads.example.com", "/"));
+        assert!(block_rule_matches(&r, "ads.example.com", "/anything"));
+        assert!(!block_rule_matches(&r, "other.example.com", "/"));
+    }
+
+    #[test]
+    fn test_block_rule_matches_wildcard_host() {
+        let r = make_block_rule("*.doubleclick.net", None, true);
+        assert!(block_rule_matches(&r, "ads.doubleclick.net", "/"));
+        assert!(block_rule_matches(&r, "pagead.doubleclick.net", "/foo"));
+        assert!(block_rule_matches(&r, "doubleclick.net", "/"));
+        assert!(!block_rule_matches(&r, "doubleclick.org", "/"));
+    }
+
+    #[test]
+    fn test_block_rule_matches_with_path_pattern() {
+        let r = make_block_rule("api.example.com", Some("/ads/*"), true);
+        assert!(block_rule_matches(&r, "api.example.com", "/ads/banner"));
+        assert!(block_rule_matches(&r, "api.example.com", "/ads"));
+        // Same host but path mismatches -> not blocked.
+        assert!(!block_rule_matches(&r, "api.example.com", "/users"));
+    }
+
+    #[test]
+    fn test_block_rule_matches_disabled_rule_ignored() {
+        // Even when host+path match, a disabled rule must not match.
+        let r = make_block_rule("ads.example.com", None, false);
+        assert!(!block_rule_matches(&r, "ads.example.com", "/"));
+    }
+
+    #[test]
+    fn test_block_rule_matches_no_host_match_returns_false() {
+        let r = make_block_rule("ads.example.com", Some("/ads/*"), true);
+        assert!(!block_rule_matches(&r, "totally.unrelated.com", "/ads/foo"));
+    }
+
+    #[test]
+    fn test_block_rule_matches_connect_path_root() {
+        // Block rules with `path_pattern = None` must match the synthetic
+        // "/" path used on the CONNECT pre-check path (so HTTPS gets blocked
+        // before any upstream socket is opened).
+        let r = make_block_rule("*.tracker.example", None, true);
+        assert!(block_rule_matches(&r, "x.tracker.example", "/"));
     }
 
     #[test]

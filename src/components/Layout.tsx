@@ -19,6 +19,7 @@ import SwapHorizIcon from '@mui/icons-material/SwapHoriz';
 import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import StopIcon from '@mui/icons-material/Stop';
 import AltRouteIcon from '@mui/icons-material/AltRoute';
+import BlockIcon from '@mui/icons-material/Block';
 import { invoke } from '@tauri-apps/api/core';
 import { buildTitle } from '../lib/version';
 
@@ -28,6 +29,7 @@ const navItems = [
   { label: 'Connections', path: '/connections', icon: <SwapHorizIcon /> },
   { label: 'Host Rules', path: '/hosts', icon: <FilterListIcon /> },
   { label: 'Interceptor', path: '/interceptor', icon: <AltRouteIcon /> },
+  { label: 'Block Rules', path: '/blocks', icon: <BlockIcon /> },
   { label: 'Setup', path: '/setup', icon: <SettingsIcon /> },
 ];
 
