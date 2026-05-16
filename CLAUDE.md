@@ -75,7 +75,7 @@ src-tauri/src/                 # Rust backend
 
 ## Rust coverage gate
 
-The `coverage` job in `build.yml` runs `cargo llvm-cov --lib --summary-only` from `src-tauri/` on Linux and fails the build if lines / functions / regions drop below the v0.1.7 floored baseline (lines ≥ 37, functions ≥ 24, regions ≥ 38). HTML reports are uploaded as the `coverage-reports` artifact (14d retention) and the totals are appended to `$GITHUB_STEP_SUMMARY`. Raise these floors when coverage improves; never lower them.
+The `coverage` job in `build.yml` runs `cargo llvm-cov --lib --summary-only` from `src-tauri/` on Linux and fails the build if lines / functions / regions drop below the v0.2.0 floored baseline (lines ≥ 37, functions ≥ 29, regions ≥ 40). HTML reports are uploaded as the `coverage-reports` artifact (14d retention) and the totals are appended to `$GITHUB_STEP_SUMMARY`. Raise these floors when coverage improves; never lower them.
 
 ## GitHub Raw File URLs
 
