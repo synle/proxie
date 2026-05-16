@@ -37,6 +37,8 @@ interface ConnectionLog {
   response_body: string | null;
   content_type: string | null;
   intercepted: boolean;
+  /** True when the request was short-circuited by a block rule. */
+  blocked?: boolean;
 }
 
 function statusColor(status: number | null): 'success' | 'warning' | 'error' | 'default' {
@@ -202,6 +204,21 @@ export default function ConnectionsPage() {
                           />
                         </Tooltip>
                       )}
+                      {conn.blocked && (
+                        <Tooltip title='Request blocked by a block rule (Pi-hole style)'>
+                          <Chip
+                            label='BLOCKED'
+                            size='small'
+                            color='error'
+                            data-testid='blocked-badge'
+                            sx={{
+                              fontSize: '0.65rem',
+                              height: 18,
+                              '& .MuiChip-label': { px: 0.75 },
+                            }}
+                          />
+                        </Tooltip>
+                      )}
                     </Box>
                   </TableCell>
                   <TableCell
@@ -266,6 +283,11 @@ export default function ConnectionsPage() {
               label='Intercepted'
               value={selected.intercepted ? 'yes' : 'no'}
               highlight={selected.intercepted}
+            />
+            <DetailRow
+              label='Blocked'
+              value={selected.blocked ? 'yes' : 'no'}
+              highlight={!!selected.blocked}
             />
             <DetailRow label='URL' value={selected.url} />
             <DetailRow label='Host' value={selected.host} />

@@ -17,6 +17,7 @@ Built with [Tauri v2](https://v2.tauri.app/) + React 19 + MUI 9 + Rust.
 - **Host Tracking** — Configure which hosts to monitor with wildcard support (`*.example.com`) and ignore paths (`/health`, `/metrics`)
 - **Live Connections** — Real-time traffic table with duration bars, status color coding, filtering, and request/response detail drawer
 - **Request Interceptor** — Mock responses (HAR format) or reroute requests to different targets, with access to request body/headers for dynamic behavior. As of v0.3.0 intercept rules apply uniformly to HTTP and HTTPS — the MITM path decrypts the request before rule matching, so the same host/path/method patterns match either scheme. Intercepted rows are flagged with a purple `INTERCEPTED` badge in the Connections table.
+- **Host Blocking (v0.4.0)** — Pi-hole-style ad/tracker blocking at the proxy layer. Define block rules with wildcard host patterns (`*.doubleclick.net`) and optional path patterns (`/ads/*`). Matching HTTPS CONNECTs are refused with `403 Forbidden` **before any upstream socket is opened**; matching HTTP/decrypted-HTTPS requests get a `204 No Content` (the HTTP-layer NXDOMAIN analogue). Blocked rows show a red `BLOCKED` chip. A "Seed Defaults" button on the Block Rules page adds a small curated list (Google Ads, DoubleClick, Hotjar, etc.) — all disabled by default, opt-in only.
 
 ## Quick Start
 
@@ -141,7 +142,24 @@ The request should appear in the **Connections** page. If `curl` fails with a TL
 | **Connections** | Live traffic table with duration visualization, filter, and detail drawer |
 | **Host Rules** | CRUD for host tracking rules with wildcard and ignore-path support |
 | **Interceptor** | Mock responses (HAR format) or reroute requests to different targets |
+| **Block Rules** | Pi-hole style blocker — short-circuit ad/tracker hosts at the proxy (204/403 + no upstream socket) |
 | **Setup** | Proxy config (port, address) and SSL certificate management |
+
+## Block Rules
+
+Block rules turn Proxie into a Charles + Pi-hole hybrid. Unlike DNS-level blockers, block rules see the actual HTTP host + path (after TLS termination for HTTPS), so you can scope blocks more precisely than NXDOMAIN allows.
+
+| Pattern | Effect |
+|---------|--------|
+| `*.doubleclick.net` (host only) | Blocks every request to any subdomain of doubleclick.net |
+| `tracker.example.com` + `/pixel/*` | Blocks only `/pixel/*` on that one host; other paths pass through |
+| `cdn.example.com` + `/ads/*` | Lets non-ad assets through while still blocking ads on the same CDN |
+
+**Order of operations in the proxy:** `block → intercept → forward`. A block rule fires before an intercept rule on the same host/path, and before any upstream socket is opened on the CONNECT path.
+
+**Response codes:** HTTP and decrypted HTTPS get **204 No Content** (empty body — the HTTP analogue of Pi-hole's NXDOMAIN, so clients treat the resource as "nothing here" rather than as a network error). Raw CONNECT short-circuits get **403 Forbidden** (the tunnel was actively refused; no upstream socket was opened).
+
+Click **Seed Defaults** on the Block Rules page to add a small curated list of well-known ad/tracker hosts as **disabled** rules — review and toggle individually. Proxie never enables block rules by default and does not ship a third-party block list (EasyList etc. — too large and licensing-sensitive).
 
 ## Tech Stack
 

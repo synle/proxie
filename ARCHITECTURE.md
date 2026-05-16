@@ -17,7 +17,7 @@ proxie is a lightweight HTTPS proxy interceptor — a free, fast alternative to 
 ## Key Directories
 
 - `src/` — React frontend (TypeScript). Vite-bundled, served at `http://localhost:1420` in dev, bundled into `dist/` for production (referenced by Tauri as `frontendDist: "../dist"`).
-  - `src/pages/` — top-level routed views: `SetupPage`, `HostRulesPage`, `ConnectionsPage`, `InterceptorPage`.
+  - `src/pages/` — top-level routed views: `SetupPage`, `HostRulesPage`, `ConnectionsPage`, `InterceptorPage`, `BlockRulesPage`.
   - `src/components/` — shared UI (currently `Layout.tsx`, the app shell).
   - `src/test/` — Vitest setup and helpers.
 - `src-tauri/` — Rust Tauri backend (crate `proxie_lib`).
@@ -38,8 +38,8 @@ proxie is a lightweight HTTPS proxy interceptor — a free, fast alternative to 
 - `src-tauri/tauri.conf.json` — Tauri v2 app config. `productName: "Proxie"`, `identifier: com.synle.proxie`, window 1200x800, bundles for all targets, icons under `icons/`. **`version` here is the authoritative app version consumed by release workflows.**
 - `src-tauri/build.rs` — `tauri-build` invocation.
 - `src-tauri/src/lib.rs` — registers all Tauri commands and constructs `AppState` in `setup()`. Single source of truth for the IPC surface.
-- `src-tauri/src/proxy.rs` — proxy accept loop and per-connection handler (TLS termination, host-rule matching, intercept-rule application, upstream forwarding, event emission).
-- `src-tauri/src/state.rs` — `AppState` with `Mutex`-guarded `PersistedState` (proxy config, host rules, intercept rules), in-memory `connections` log, and a `tokio::sync::Notify` shutdown signal. Persistence is JSON written under the OS config dir resolved via `dirs`.
+- `src-tauri/src/proxy.rs` — proxy accept loop and per-connection handler (TLS termination, host-rule matching, intercept-rule application, upstream forwarding, event emission). Per-request rule precedence is **block → intercept → forward**: block rules fire first (on plain HTTP, on the raw CONNECT path before any upstream socket opens, and again after MITM decryption for rules with a `path_pattern`); intercept rules run only when no block rule matched; un-matched requests are forwarded upstream. `serve_block_http` returns `204 No Content`, `serve_block_https` returns `204` over the terminated TLS stream, and `serve_block_connect` returns `403 Forbidden` + immediate close on the raw CONNECT path.
+- `src-tauri/src/state.rs` — `AppState` with `Mutex`-guarded `PersistedState` (proxy config, host rules, intercept rules, **block rules** — added v0.4.0), in-memory `connections` log, and a `tokio::sync::Notify` shutdown signal. Persistence is JSON written under the OS config dir resolved via `dirs`. Every new `PersistedState` field uses `#[serde(default)]` so older configs keep deserializing.
 - `src-tauri/src/cert.rs` — root CA generation and per-host leaf cert minting for on-the-fly TLS termination.
 - `DEV.md` — developer quickstart (prereqs, dev/build/test commands).
 

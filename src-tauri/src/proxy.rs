@@ -139,6 +139,24 @@ async fn handle_connect_tunnel(
     let host = host_port.first().copied().unwrap_or("unknown").to_string();
     let port: u16 = host_port.get(1).and_then(|p| p.parse().ok()).unwrap_or(443);
 
+    // Block-rule fast path — runs BEFORE we open an upstream socket or do
+    // any TLS handshake. We can't see the inner path at CONNECT time so we
+    // synthesize "/", which matches block rules with `path_pattern = None`
+    // (host-only blocks). Rules with a non-None path_pattern fall through
+    // here and are re-checked after MITM decrypts the inner request.
+    if let Some(rule) = state.find_block_rule(&host, "/").await {
+        return serve_block_connect(
+            client_stream,
+            &host,
+            target,
+            &rule,
+            state,
+            app_handle,
+            start,
+        )
+        .await;
+    }
+
     // Check if this host is being tracked (purely informational for logs).
     let rules = state.get_host_rules().await.unwrap_or_default();
     let is_tracked = rules
@@ -221,6 +239,7 @@ async fn blind_tunnel(
         ),
         content_type: None,
         intercepted: false,
+        blocked: false,
     };
     state.add_connection(conn.clone()).await;
     let _ = app_handle.emit("proxy:connection", &conn);
@@ -348,6 +367,26 @@ async fn mitm_connect(
         .filter(|s| !s.is_empty());
 
     let url = format!("https://{}{}", host, path);
+
+    // Re-check block rules with the decrypted path — this catches rules
+    // with a `path_pattern` that the CONNECT-time check couldn't evaluate
+    // (we only had "/" then). Runs BEFORE the intercept-rule check.
+    if let Some(rule) = state.find_block_rule(host, &path).await {
+        return serve_block_https(
+            &mut tls_client,
+            &method,
+            &url,
+            host,
+            &path,
+            &request_headers,
+            &request_body,
+            &rule,
+            state,
+            app_handle,
+            start,
+        )
+        .await;
+    }
 
     // Apply intercept rules on the decrypted request.
     if let Some(rule) = state.find_intercept_rule(host, &path, &method).await {
@@ -488,6 +527,7 @@ async fn mitm_connect(
         response_body,
         content_type,
         intercepted: false,
+        blocked: false,
     };
     state.add_connection(conn.clone()).await;
     let _ = app_handle.emit("proxy:connection", &conn);
@@ -547,6 +587,7 @@ async fn serve_intercept_over_tls(
                 response_body: Some(body.to_string()),
                 content_type: Some(content_type),
                 intercepted: true,
+                blocked: false,
             };
             state.add_connection(conn.clone()).await;
             let _ = app_handle.emit("proxy:connection", &conn);
@@ -611,6 +652,7 @@ async fn serve_intercept_over_tls(
                 response_body: None,
                 content_type,
                 intercepted: true,
+                blocked: false,
             };
             state.add_connection(conn.clone()).await;
             let _ = app_handle.emit("proxy:connection", &conn);
@@ -653,6 +695,7 @@ async fn log_mitm_failure(
         response_body: Some(format!("MITM error: {}", note)),
         content_type: None,
         intercepted: false,
+        blocked: false,
     };
     state.add_connection(conn.clone()).await;
     let _ = app_handle.emit("proxy:connection", &conn);
@@ -777,6 +820,27 @@ async fn handle_http_request(
         })
         .collect();
 
+    // Block rules run BEFORE intercept rules and BEFORE any upstream socket
+    // is opened — match-and-short-circuit with 204 No Content (Pi-hole-style
+    // empty body so the client treats the resource as missing rather than
+    // erroring on a refused connection).
+    if let Some(rule) = state.find_block_rule(&host, &path).await {
+        return serve_block_http(
+            client_stream,
+            method,
+            url,
+            &host,
+            &path,
+            &request_headers,
+            &request_body,
+            &rule,
+            state,
+            app_handle,
+            start,
+        )
+        .await;
+    }
+
     // Check for matching intercept rule
     if let Some(rule) = state.find_intercept_rule(&host, &path, method).await {
         return handle_intercepted_request(
@@ -855,6 +919,7 @@ async fn handle_http_request(
         response_body: None,
         content_type: None,
         intercepted: false,
+        blocked: false,
     };
     state.add_connection(conn.clone()).await;
     let _ = app_handle.emit("proxy:connection", &conn);
@@ -937,6 +1002,7 @@ async fn handle_intercepted_request(
                 response_body: Some(body.to_string()),
                 content_type: Some(content_type),
                 intercepted: true,
+                blocked: false,
             };
             state.add_connection(conn.clone()).await;
             let _ = app_handle.emit("proxy:connection", &conn);
@@ -1019,6 +1085,7 @@ async fn handle_intercepted_request(
                 response_body: None,
                 content_type: None,
                 intercepted: true,
+                blocked: false,
             };
             state.add_connection(conn.clone()).await;
             let _ = app_handle.emit("proxy:connection", &conn);
@@ -1164,6 +1231,187 @@ pub fn build_mock_response(action: &InterceptAction) -> Option<Vec<u8>> {
         }
         InterceptAction::Reroute { .. } => None,
     }
+}
+
+// -------------------------------------------------------------------------
+// Block-rule (Pi-hole style) response helpers.
+// -------------------------------------------------------------------------
+
+/// Build the raw HTTP/1.1 response bytes returned to a client when a
+/// [`crate::types::BlockRule`] matches a decrypted HTTP/HTTPS request.
+///
+/// We use `204 No Content` (not `403 Forbidden`) as the HTTP-layer analogue
+/// of Pi-hole's NXDOMAIN: an empty, successful-looking response so the
+/// client treats the blocked resource as "nothing to render here" rather
+/// than as a server error that triggers retries or error UI.
+///
+/// The 403 path is reserved for the raw CONNECT short-circuit
+/// ([`build_block_connect_response_bytes`]) where there is no decrypted
+/// HTTP envelope to fill — the client needs to know the tunnel was
+/// actively refused.
+///
+/// # Returns
+/// `HTTP/1.1 204 No Content` with `Content-Length: 0`,
+/// `Connection: close`, and an `X-Blocked-By: Proxie` marker header.
+pub fn build_block_http_response_bytes() -> Vec<u8> {
+    let mut resp = String::from("HTTP/1.1 204 No Content\r\n");
+    resp.push_str("Content-Length: 0\r\n");
+    resp.push_str("X-Blocked-By: Proxie\r\n");
+    resp.push_str("Connection: close\r\n\r\n");
+    resp.into_bytes()
+}
+
+/// Build the raw HTTP/1.1 response bytes returned over the CONNECT socket
+/// when a block rule matches BEFORE the TLS handshake (no upstream socket
+/// is opened, no leaf cert is minted). 403 + empty body + immediate close
+/// is the closest TCP-layer analogue of a Pi-hole DNS sinkhole.
+pub fn build_block_connect_response_bytes() -> Vec<u8> {
+    let mut resp = String::from("HTTP/1.1 403 Forbidden\r\n");
+    resp.push_str("Content-Length: 0\r\n");
+    resp.push_str("X-Blocked-By: Proxie\r\n");
+    resp.push_str("Connection: close\r\n\r\n");
+    resp.into_bytes()
+}
+
+/// Short-circuit a plain-HTTP request with a 204 No Content reply, log
+/// the blocked connection, and emit the `proxy:connection` event.
+#[allow(clippy::too_many_arguments)]
+async fn serve_block_http(
+    client_stream: &mut tokio::net::TcpStream,
+    method: &str,
+    url: &str,
+    host: &str,
+    path: &str,
+    request_headers: &[(String, String)],
+    request_body: &Option<String>,
+    rule: &crate::types::BlockRule,
+    state: &Arc<AppState>,
+    app_handle: &AppHandle,
+    start: std::time::Instant,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let bytes = build_block_http_response_bytes();
+    client_stream.write_all(&bytes).await?;
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let conn = ConnectionLog {
+        id: uuid::Uuid::new_v4().to_string(),
+        method: method.to_string(),
+        url: url.to_string(),
+        host: host.to_string(),
+        path: path.to_string(),
+        status: Some(204),
+        duration_ms: Some(duration_ms),
+        request_size: None,
+        response_size: Some(bytes.len() as u64),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        request_headers: request_headers.to_vec(),
+        response_headers: vec![
+            ("X-Blocked-By".to_string(), "Proxie".to_string()),
+            ("Connection".to_string(), "close".to_string()),
+        ],
+        request_body: request_body.clone(),
+        response_body: Some(format!("blocked by rule: {}", rule.note)),
+        content_type: None,
+        intercepted: false,
+        blocked: true,
+    };
+    state.add_connection(conn.clone()).await;
+    let _ = app_handle.emit("proxy:connection", &conn);
+    log::info!("Blocked HTTP {} {} (rule: {})", method, url, rule.note);
+    Ok(())
+}
+
+/// Short-circuit a decrypted HTTPS request (post-MITM) with a 204 No
+/// Content reply written back over the terminated TLS stream.
+#[allow(clippy::too_many_arguments)]
+async fn serve_block_https(
+    tls_client: &mut tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    method: &str,
+    url: &str,
+    host: &str,
+    path: &str,
+    request_headers: &[(String, String)],
+    request_body: &Option<String>,
+    rule: &crate::types::BlockRule,
+    state: &Arc<AppState>,
+    app_handle: &AppHandle,
+    start: std::time::Instant,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let bytes = build_block_http_response_bytes();
+    let _ = tls_client.write_all(&bytes).await;
+    let _ = tls_client.shutdown().await;
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let conn = ConnectionLog {
+        id: uuid::Uuid::new_v4().to_string(),
+        method: method.to_string(),
+        url: url.to_string(),
+        host: host.to_string(),
+        path: path.to_string(),
+        status: Some(204),
+        duration_ms: Some(duration_ms),
+        request_size: None,
+        response_size: Some(bytes.len() as u64),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        request_headers: request_headers.to_vec(),
+        response_headers: vec![
+            ("X-Blocked-By".to_string(), "Proxie".to_string()),
+            ("Connection".to_string(), "close".to_string()),
+        ],
+        request_body: request_body.clone(),
+        response_body: Some(format!("blocked by rule: {}", rule.note)),
+        content_type: None,
+        intercepted: false,
+        blocked: true,
+    };
+    state.add_connection(conn.clone()).await;
+    let _ = app_handle.emit("proxy:connection", &conn);
+    log::info!("Blocked HTTPS {} {} (rule: {})", method, url, rule.note);
+    Ok(())
+}
+
+/// Short-circuit a CONNECT request on the raw TCP path — replies 403,
+/// closes the socket, and never opens an upstream connection.
+async fn serve_block_connect(
+    mut client_stream: tokio::net::TcpStream,
+    host: &str,
+    target: &str,
+    rule: &crate::types::BlockRule,
+    state: &Arc<AppState>,
+    app_handle: &AppHandle,
+    start: std::time::Instant,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let bytes = build_block_connect_response_bytes();
+    let _ = client_stream.write_all(&bytes).await;
+    let _ = client_stream.shutdown().await;
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let conn = ConnectionLog {
+        id: uuid::Uuid::new_v4().to_string(),
+        method: "CONNECT".to_string(),
+        url: format!("https://{}", target),
+        host: host.to_string(),
+        path: "/".to_string(),
+        status: Some(403),
+        duration_ms: Some(duration_ms),
+        request_size: None,
+        response_size: Some(bytes.len() as u64),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        request_headers: vec![],
+        response_headers: vec![
+            ("X-Blocked-By".to_string(), "Proxie".to_string()),
+            ("Connection".to_string(), "close".to_string()),
+        ],
+        request_body: None,
+        response_body: Some(format!("blocked by rule: {}", rule.note)),
+        content_type: None,
+        intercepted: false,
+        blocked: true,
+    };
+    state.add_connection(conn.clone()).await;
+    let _ = app_handle.emit("proxy:connection", &conn);
+    log::info!("Blocked CONNECT {} (rule: {})", target, rule.note);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1533,5 +1781,73 @@ mod tests {
         // origin-form paths ("/foo") — confirm the host check stays true
         // regardless of port.
         assert!(host_matches("api.example.test", "api.example.test"));
+    }
+
+    // ---------------------------------------------------------------
+    // Block-rule (Pi-hole) byte-contract regressions.
+    //
+    // These tests pin the wire bytes the proxy returns to a client
+    // when a BlockRule matches. We deliberately do NOT spin up a real
+    // TCP/TLS harness — instead we verify the pure response-byte
+    // builders that `serve_block_*` write back. Combined with the
+    // matching-predicate tests in `state.rs`, this covers the
+    // "block-rule fires correctly and produces the right bytes"
+    // contract end-to-end.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_build_block_http_response_is_204_no_content() {
+        // HTTP-layer block: 204 No Content + empty body + close.
+        // 204 is the Pi-hole analogue (NXDOMAIN -> "nothing here").
+        let bytes = build_block_http_response_bytes();
+        let s = String::from_utf8(bytes.clone()).unwrap();
+        assert!(s.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert!(s.contains("Content-Length: 0\r\n"));
+        assert!(s.contains("X-Blocked-By: Proxie\r\n"));
+        assert!(s.contains("Connection: close\r\n"));
+        assert!(s.ends_with("\r\n\r\n"));
+
+        // Roundtrip through the parser the proxy uses for upstream
+        // responses — proves the bytes are well-formed enough to be
+        // logged correctly if any future code path tries to parse them.
+        let (status, headers, body, content_type) = parse_response(&bytes);
+        assert_eq!(status, Some(204));
+        assert_eq!(body.as_deref(), Some(""));
+        assert!(content_type.is_none());
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k == "X-Blocked-By" && v == "Proxie"));
+    }
+
+    #[test]
+    fn test_build_block_connect_response_is_403_forbidden() {
+        // CONNECT pre-MITM block: 403 + close. We can't return 204 here
+        // because the client expects a "200 Connection Established" if
+        // the tunnel opened — 403 explicitly signals the tunnel was
+        // refused before any upstream socket was opened.
+        let bytes = build_block_connect_response_bytes();
+        let s = String::from_utf8(bytes.clone()).unwrap();
+        assert!(s.starts_with("HTTP/1.1 403 Forbidden\r\n"));
+        assert!(s.contains("Content-Length: 0\r\n"));
+        assert!(s.contains("X-Blocked-By: Proxie\r\n"));
+        assert!(s.contains("Connection: close\r\n"));
+        assert!(s.ends_with("\r\n\r\n"));
+
+        let (status, _h, body, _ct) = parse_response(&bytes);
+        assert_eq!(status, Some(403));
+        assert_eq!(body.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_block_response_bytes_differ_by_path() {
+        // The HTTP-layer (204) and CONNECT-layer (403) replies must NOT
+        // be the same payload — they signal different things to the
+        // client. This is the load-bearing contract: don't accidentally
+        // converge them in a future refactor.
+        let http_bytes = build_block_http_response_bytes();
+        let connect_bytes = build_block_connect_response_bytes();
+        assert_ne!(http_bytes, connect_bytes);
+        assert!(String::from_utf8_lossy(&http_bytes).contains("204"));
+        assert!(String::from_utf8_lossy(&connect_bytes).contains("403"));
     }
 }
