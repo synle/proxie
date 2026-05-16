@@ -133,6 +133,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_RELEASE: 'true'
+          # Stamp the official AppBar title (no DEV/Beta tag, no SHA).
+          # Picked up by the Vite `define` block in `vite.config.ts`.
+          RELEASE_CHANNEL: official
+          GIT_SHA: ${{ needs.prepare.outputs.sha || github.sha }}
         with:
           tagName: ${{ needs.prepare.outputs.tag }}
           releaseName: 'Proxie ${{ needs.prepare.outputs.tag }}'
