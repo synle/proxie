@@ -2825,11 +2825,14 @@ dependencies = [
 
 [[package]]
 name = "proxie"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
+ "base64 0.22.1",
+ "brotli",
  "chrono",
  "dirs",
  "env_logger",
+ "flate2",
  "http-body-util",
  "hyper",
  "hyper-util",

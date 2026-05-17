@@ -194,3 +194,206 @@ describe('ConnectionsPage — blocked badge', () => {
     expect(highlighted[0]).toHaveTextContent('yes');
   });
 });
+
+describe('ConnectionsPage — body preview', () => {
+  const invokeMock = invoke as unknown as ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it('renders an <img> when the response body is a data: image URI', async () => {
+    const row = makeConn({
+      id: 'preview-1',
+      content_type: 'image/png',
+      response_headers: [['Content-Type', 'image/png']] as [string, string][],
+      // 1x1 transparent PNG (data URI).
+      response_body:
+        'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=',
+    });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return [row];
+      return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() => {
+      expect(screen.getByText('https://api.example.com/foo')).toBeInTheDocument();
+    });
+    await userEvent.click(screen.getByText('https://api.example.com/foo'));
+
+    const img = await screen.findByTestId('body-preview-image');
+    expect(img.tagName.toLowerCase()).toBe('img');
+    expect(img.getAttribute('src')).toMatch(/^data:image\/png;base64,/);
+    // Should NOT render the corrupted-text fallback.
+    expect(screen.queryByTestId('body-preview-text')).toBeNull();
+  });
+
+  it('renders a binary placeholder for non-previewable mime types', async () => {
+    const row = makeConn({
+      id: 'preview-2',
+      content_type: 'application/octet-stream',
+      response_headers: [['Content-Type', 'application/octet-stream']] as [string, string][],
+      response_body: 'data:application/octet-stream;base64,AAECAwQFBgcICQ==',
+    });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return [row];
+      return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() =>
+      expect(screen.getByText('https://api.example.com/foo')).toBeInTheDocument(),
+    );
+    await userEvent.click(screen.getByText('https://api.example.com/foo'));
+
+    const placeholder = await screen.findByTestId('body-preview-binary-placeholder');
+    expect(placeholder).toHaveTextContent(/Binary content/i);
+    expect(placeholder).toHaveTextContent('application/octet-stream');
+  });
+
+  it('renders text bodies in a <pre> block', async () => {
+    const row = makeConn({
+      id: 'preview-3',
+      response_body: '{"ok":true}',
+    });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return [row];
+      return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() =>
+      expect(screen.getByText('https://api.example.com/foo')).toBeInTheDocument(),
+    );
+    await userEvent.click(screen.getByText('https://api.example.com/foo'));
+
+    const pre = await screen.findByTestId('body-preview-text');
+    expect(pre).toHaveTextContent('{"ok":true}');
+  });
+});
+
+describe('ConnectionsPage — format / codegen', () => {
+  const invokeMock = invoke as unknown as ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it('pretty-prints a JSON response body when Format is clicked', async () => {
+    const row = makeConn({
+      id: 'fmt-1',
+      response_body: '{"a":1,"b":[2,3]}',
+      content_type: 'application/json',
+      response_headers: [['Content-Type', 'application/json']] as [string, string][],
+    });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return [row];
+      return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() =>
+      expect(screen.getByText('https://api.example.com/foo')).toBeInTheDocument(),
+    );
+    await userEvent.click(screen.getByText('https://api.example.com/foo'));
+
+    const fmtBtn = await screen.findByTestId('response-body-format');
+    await userEvent.click(fmtBtn);
+
+    const pre = screen.getByTestId('body-preview-text');
+    // Multi-line + indented JSON output.
+    expect(pre.textContent).toMatch(/\{\n {2}"a": 1,/);
+    expect(pre.textContent).toMatch(/"b": \[\n {4}2,\n {4}3\n {2}\]\n\}/);
+  });
+
+  it('generates a curl command by default in the codegen panel', async () => {
+    const row = makeConn({
+      id: 'cg-1',
+      method: 'POST',
+      url: 'https://api.example.com/login',
+      request_headers: [
+        ['Content-Type', 'application/json'],
+        ['X-Trace', 'abc'],
+      ] as [string, string][],
+      request_body: '{"u":"x"}',
+    });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return [row];
+      return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() =>
+      expect(screen.getByText('https://api.example.com/login')).toBeInTheDocument(),
+    );
+    await userEvent.click(screen.getByText('https://api.example.com/login'));
+
+    const output = await screen.findByTestId('codegen-output');
+    expect(output.textContent).toMatch(/^curl -X POST/);
+    expect(output.textContent).toContain("https://api.example.com/login");
+    expect(output.textContent).toContain('-H ');
+    expect(output.textContent).toContain('Content-Type: application/json');
+    expect(output.textContent).toContain('--data-raw');
+  });
+});
+
+describe('ConnectionsPage — column filters', () => {
+  const invokeMock = invoke as unknown as ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it('filters rows by URL-contains in the column header', async () => {
+    const user = userEvent.setup();
+    const rows = [
+      makeConn({ id: 'cf-1', url: 'https://api.alpha.com/x' }),
+      makeConn({ id: 'cf-2', url: 'https://api.beta.com/y' }),
+    ];
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return rows;
+      return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() => {
+      expect(screen.getByText('https://api.alpha.com/x')).toBeInTheDocument();
+      expect(screen.getByText('https://api.beta.com/y')).toBeInTheDocument();
+    });
+
+    const urlFilter = within(screen.getByTestId('url-filter')).getByRole('textbox');
+    await user.type(urlFilter, 'beta');
+
+    await waitFor(() => {
+      expect(screen.queryByText('https://api.alpha.com/x')).toBeNull();
+      expect(screen.getByText('https://api.beta.com/y')).toBeInTheDocument();
+    });
+  });
+
+  it('filters rows by duration with the >= operator', async () => {
+    const user = userEvent.setup();
+    const rows = [
+      makeConn({ id: 'cf-3', url: 'https://api.slow.com/a', duration_ms: 1500 }),
+      makeConn({ id: 'cf-4', url: 'https://api.fast.com/b', duration_ms: 50 }),
+    ];
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return rows;
+      return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() => {
+      expect(screen.getByText('https://api.slow.com/a')).toBeInTheDocument();
+      expect(screen.getByText('https://api.fast.com/b')).toBeInTheDocument();
+    });
+
+    const durationInput = within(screen.getByTestId('duration-value')).getByRole('textbox');
+    await user.type(durationInput, '500');
+
+    await waitFor(() => {
+      expect(screen.getByText('https://api.slow.com/a')).toBeInTheDocument();
+      expect(screen.queryByText('https://api.fast.com/b')).toBeNull();
+    });
+  });
+});

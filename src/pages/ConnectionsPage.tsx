@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import {
   Box,
   Typography,
@@ -14,9 +14,21 @@ import {
   Card,
   CardContent,
   Drawer,
+  Select,
+  MenuItem,
+  FormControl,
+  OutlinedInput,
+  Stack,
+  Button,
+  Snackbar,
+  Alert,
 } from '@mui/material';
+import type { SelectChangeEvent } from '@mui/material';
 import DeleteSweepIcon from '@mui/icons-material/DeleteSweep';
 import RefreshIcon from '@mui/icons-material/Refresh';
+import DownloadIcon from '@mui/icons-material/Download';
+import AutoFixHighIcon from '@mui/icons-material/AutoFixHigh';
+import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 
@@ -76,10 +88,382 @@ function DurationBar({ ms }: { ms: number | null }) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Body decoding — server sends either plain UTF-8 text OR a
+// `data:<mime>;base64,<payload>` URI for non-text content.
+// ---------------------------------------------------------------------------
+
+interface DecodedBody {
+  isDataUri: boolean;
+  mime: string;
+  /** When isDataUri = false this is the original text. */
+  text: string;
+  /** When isDataUri = true this is the full `data:` URI (suitable for src=). */
+  dataUri: string;
+  /** Decoded byte length for binary, or text byte length. */
+  byteLength: number;
+}
+
+function decodeBody(body: string | null, contentTypeHint: string | null): DecodedBody | null {
+  if (body == null) return null;
+  if (body.startsWith('data:')) {
+    const match = /^data:([^;]+);base64,(.*)$/s.exec(body);
+    if (match) {
+      const mime = match[1].trim() || contentTypeHint || 'application/octet-stream';
+      const b64 = match[2];
+      let byteLength = 0;
+      try {
+        const bin = atob(b64);
+        byteLength = bin.length;
+      } catch {
+        byteLength = b64.length;
+      }
+      return { isDataUri: true, mime, text: '', dataUri: body, byteLength };
+    }
+  }
+  const mime = (contentTypeHint ?? 'text/plain').split(';')[0].trim();
+  return {
+    isDataUri: false,
+    mime: mime || 'text/plain',
+    text: body,
+    dataUri: '',
+    byteLength: body.length,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Formatting helpers — best-effort pretty printers for JSON/XML/HTML/CSS/JS.
+// Pure client-side, no external deps. Returns null on failure (caller keeps original).
+// ---------------------------------------------------------------------------
+
+function formatJson(s: string): string | null {
+  try {
+    return JSON.stringify(JSON.parse(s), null, 2);
+  } catch {
+    return null;
+  }
+}
+
+function formatXml(s: string): string | null {
+  try {
+    // Tag-by-tag re-indent. Naive but adequate for HAR-style payloads.
+    const PADDING = '  ';
+    const reg = /(>)(<)(\/*)/g;
+    let xml = s.replace(/^\s+|\s+$/g, '').replace(reg, '$1\n$2$3');
+    let pad = 0;
+    const out: string[] = [];
+    for (const line of xml.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      if (/^<\/[^>]+>$/.test(trimmed)) pad = Math.max(pad - 1, 0);
+      out.push(PADDING.repeat(pad) + trimmed);
+      const isSelfClosing = /^<[^!?][^>]*\/>$/.test(trimmed) || /^<\?/.test(trimmed) || /^<!/.test(trimmed);
+      const isOpenAndClose = /^<([^\s/>]+)[^>]*>.*<\/\1>$/.test(trimmed);
+      if (/^<[^!?/][^>]*[^/]>$/.test(trimmed) && !isSelfClosing && !isOpenAndClose) pad++;
+    }
+    return out.join('\n');
+  } catch {
+    return null;
+  }
+}
+
+function formatCssOrJs(s: string): string | null {
+  try {
+    let depth = 0;
+    let out = '';
+    let inStr: '"' | "'" | '`' | null = null;
+    let prev = '';
+    for (let i = 0; i < s.length; i++) {
+      const ch = s[i];
+      if (inStr) {
+        out += ch;
+        if (ch === inStr && prev !== '\\') inStr = null;
+        prev = ch;
+        continue;
+      }
+      if (ch === '"' || ch === "'" || ch === '`') {
+        inStr = ch;
+        out += ch;
+        prev = ch;
+        continue;
+      }
+      if (ch === '{') {
+        depth++;
+        out += '{\n' + '  '.repeat(depth);
+      } else if (ch === '}') {
+        depth = Math.max(depth - 1, 0);
+        out = out.replace(/\s+$/, '') + '\n' + '  '.repeat(depth) + '}';
+        if (s[i + 1] && s[i + 1] !== ';' && s[i + 1] !== ',' && s[i + 1] !== ')') {
+          out += '\n' + '  '.repeat(depth);
+        }
+      } else if (ch === ';') {
+        out += ';\n' + '  '.repeat(depth);
+      } else if (ch === '\n' || ch === '\r') {
+        // collapse — our own newlines take over.
+      } else {
+        out += ch;
+      }
+      prev = ch;
+    }
+    return out.replace(/\n\s*\n+/g, '\n').trim();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Pick a formatter based on MIME. Returns null when no formatter matches or
+ * formatting itself failed (caller should fall back to the original string).
+ */
+function formatByMime(s: string, mime: string): string | null {
+  const m = mime.toLowerCase();
+  if (m.includes('json')) return formatJson(s);
+  if (m.includes('xml') || m.includes('html')) return formatXml(s);
+  if (m.includes('css')) return formatCssOrJs(s);
+  if (m.includes('javascript') || m.includes('ecmascript')) return formatCssOrJs(s);
+  // Plain text: nothing to do.
+  return null;
+}
+
+function isFormatterMime(mime: string): boolean {
+  const m = mime.toLowerCase();
+  return (
+    m.includes('json') ||
+    m.includes('xml') ||
+    m.includes('html') ||
+    m.includes('css') ||
+    m.includes('javascript') ||
+    m.includes('ecmascript')
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Save helpers — trigger a browser download from the in-page webview.
+// ---------------------------------------------------------------------------
+
+function downloadFromString(text: string, mime: string, filename: string) {
+  const blob = new Blob([text], { type: mime || 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  triggerDownload(url, filename);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function downloadFromDataUri(dataUri: string, filename: string) {
+  // <a href="data:..." download> works directly in the webview.
+  triggerDownload(dataUri, filename);
+}
+
+function triggerDownload(url: string, filename: string) {
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
+const EXT_BY_MIME: Record<string, string> = {
+  'application/json': 'json',
+  'application/xml': 'xml',
+  'text/xml': 'xml',
+  'text/html': 'html',
+  'text/css': 'css',
+  'text/plain': 'txt',
+  'application/javascript': 'js',
+  'text/javascript': 'js',
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/gif': 'gif',
+  'image/webp': 'webp',
+  'image/svg+xml': 'svg',
+  'video/mp4': 'mp4',
+  'video/webm': 'webm',
+  'audio/mpeg': 'mp3',
+  'audio/wav': 'wav',
+  'application/pdf': 'pdf',
+  'application/octet-stream': 'bin',
+};
+
+function inferFilename(url: string, mime: string, suffix: string): string {
+  let base = 'body';
+  try {
+    const u = new URL(url);
+    const seg = u.pathname.split('/').filter(Boolean).pop();
+    if (seg) base = seg.split('?')[0].split('#')[0];
+  } catch {
+    // Bare URL — keep "body".
+  }
+  const hasExt = /\.[a-z0-9]+$/i.test(base);
+  if (hasExt) return `${base}.${suffix}`.replace(/(\.[^.]+)\.\1?$/, '$1');
+  const ext = EXT_BY_MIME[mime.toLowerCase()] || 'txt';
+  return `${base}-${suffix}.${ext}`;
+}
+
+// ---------------------------------------------------------------------------
+// Code generators for curl / python-requests / node fetch.
+// ---------------------------------------------------------------------------
+
+type CodegenLang = 'curl' | 'python' | 'node';
+
+function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+function pyQuote(s: string): string {
+  return JSON.stringify(s);
+}
+
+function generateCode(conn: ConnectionLog, lang: CodegenLang): string {
+  const headers = conn.request_headers ?? [];
+  const body = conn.request_body ?? '';
+  const hasBody = body.length > 0 && conn.method !== 'GET' && conn.method !== 'HEAD';
+  // For binary bodies we placeholder-out the payload — base64 round-tripping
+  // would just confuse the user pasting this into a terminal.
+  const isBinaryBody = body.startsWith('data:');
+  const bodyForCode = isBinaryBody ? '<binary body — see request in Proxie>' : body;
+
+  if (lang === 'curl') {
+    const lines = [`curl -X ${conn.method} ${shellQuote(conn.url)}`];
+    for (const [k, v] of headers) {
+      lines.push(`  -H ${shellQuote(`${k}: ${v}`)}`);
+    }
+    if (hasBody) {
+      lines.push(`  --data-raw ${shellQuote(bodyForCode)}`);
+    }
+    return lines.join(' \\\n');
+  }
+
+  if (lang === 'python') {
+    const hdrEntries = headers.map(([k, v]) => `    ${pyQuote(k)}: ${pyQuote(v)},`).join('\n');
+    const lines = [
+      'import requests',
+      '',
+      `url = ${pyQuote(conn.url)}`,
+      `headers = {\n${hdrEntries}\n}` || 'headers = {}',
+    ];
+    if (hasBody) {
+      lines.push(`data = ${pyQuote(bodyForCode)}`);
+      lines.push(
+        `resp = requests.request(${pyQuote(conn.method)}, url, headers=headers, data=data)`,
+      );
+    } else {
+      lines.push(`resp = requests.request(${pyQuote(conn.method)}, url, headers=headers)`);
+    }
+    lines.push('print(resp.status_code)');
+    lines.push('print(resp.text)');
+    return lines.join('\n');
+  }
+
+  // node fetch
+  const hdrLines = headers.map(([k, v]) => `    ${JSON.stringify(k)}: ${JSON.stringify(v)},`).join('\n');
+  const initLines: string[] = [`  method: ${JSON.stringify(conn.method)},`];
+  initLines.push(`  headers: {\n${hdrLines}\n  },`);
+  if (hasBody) initLines.push(`  body: ${JSON.stringify(bodyForCode)},`);
+  return [
+    `const url = ${JSON.stringify(conn.url)};`,
+    `const resp = await fetch(url, {`,
+    initLines.join('\n'),
+    `});`,
+    `console.log(resp.status);`,
+    `console.log(await resp.text());`,
+  ].join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Column-filter state & helpers
+// ---------------------------------------------------------------------------
+
+const METHOD_OPTIONS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS', 'CONNECT'];
+const STATUS_BUCKETS = [
+  { label: '1xx', test: (s: number) => s >= 100 && s < 200 },
+  { label: '2xx', test: (s: number) => s >= 200 && s < 300 },
+  { label: '3xx', test: (s: number) => s >= 300 && s < 400 },
+  { label: '4xx', test: (s: number) => s >= 400 && s < 500 },
+  { label: '5xx', test: (s: number) => s >= 500 && s < 600 },
+];
+const TIME_WINDOWS: { label: string; ms: number | null }[] = [
+  { label: 'Any', ms: null },
+  { label: 'Last 5 min', ms: 5 * 60 * 1000 },
+  { label: 'Last 15 min', ms: 15 * 60 * 1000 },
+  { label: 'Last 1 h', ms: 60 * 60 * 1000 },
+  { label: 'Last 6 h', ms: 6 * 60 * 60 * 1000 },
+  { label: 'Last 24 h', ms: 24 * 60 * 60 * 1000 },
+];
+
+type Op = '>=' | '<=';
+
+interface ColumnFilters {
+  methods: string[];
+  statusBuckets: string[];
+  urlContains: string;
+  durationOp: Op;
+  durationValue: string;
+  sizeOp: Op;
+  sizeValue: string;
+  timeWindowMs: number | null;
+}
+
+const DEFAULT_FILTERS: ColumnFilters = {
+  methods: [],
+  statusBuckets: [],
+  urlContains: '',
+  durationOp: '>=',
+  durationValue: '',
+  sizeOp: '>=',
+  sizeValue: '',
+  timeWindowMs: null,
+};
+
+function matchesColumnFilters(c: ConnectionLog, f: ColumnFilters, now: number): boolean {
+  if (f.methods.length > 0 && !f.methods.includes(c.method.toUpperCase())) return false;
+  if (f.statusBuckets.length > 0) {
+    if (c.status == null) return false;
+    const inBucket = STATUS_BUCKETS.some(
+      (b) => f.statusBuckets.includes(b.label) && b.test(c.status as number),
+    );
+    if (!inBucket) return false;
+  }
+  if (f.urlContains.trim()) {
+    if (!c.url.toLowerCase().includes(f.urlContains.toLowerCase().trim())) return false;
+  }
+  if (f.durationValue.trim()) {
+    const v = Number(f.durationValue);
+    if (Number.isFinite(v)) {
+      const ms = c.duration_ms;
+      if (ms == null) return false;
+      if (f.durationOp === '>=' && !(ms >= v)) return false;
+      if (f.durationOp === '<=' && !(ms <= v)) return false;
+    }
+  }
+  if (f.sizeValue.trim()) {
+    const v = Number(f.sizeValue);
+    if (Number.isFinite(v)) {
+      const sz = c.response_size;
+      if (sz == null) return false;
+      if (f.sizeOp === '>=' && !(sz >= v)) return false;
+      if (f.sizeOp === '<=' && !(sz <= v)) return false;
+    }
+  }
+  if (f.timeWindowMs != null) {
+    const t = Date.parse(c.timestamp);
+    if (!Number.isFinite(t)) return false;
+    if (now - t > f.timeWindowMs) return false;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Component
+// ---------------------------------------------------------------------------
+
 export default function ConnectionsPage() {
   const [connections, setConnections] = useState<ConnectionLog[]>([]);
   const [filter, setFilter] = useState('');
+  const [colFilters, setColFilters] = useState<ColumnFilters>(DEFAULT_FILTERS);
   const [selected, setSelected] = useState<ConnectionLog | null>(null);
+  const [toast, setToast] = useState<{ kind: 'success' | 'error' | 'info'; msg: string } | null>(
+    null,
+  );
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const loadConnections = useCallback(async () => {
@@ -118,16 +502,21 @@ export default function ConnectionsPage() {
     }
   };
 
-  const filtered = connections.filter((c) => {
-    if (!filter) return true;
-    const term = filter.toLowerCase();
-    return (
-      c.url.toLowerCase().includes(term) ||
-      c.host.toLowerCase().includes(term) ||
-      c.method.toLowerCase().includes(term) ||
-      String(c.status).includes(term)
-    );
-  });
+  const filtered = useMemo(() => {
+    const now = Date.now();
+    return connections.filter((c) => {
+      if (filter) {
+        const term = filter.toLowerCase();
+        const hit =
+          c.url.toLowerCase().includes(term) ||
+          c.host.toLowerCase().includes(term) ||
+          c.method.toLowerCase().includes(term) ||
+          String(c.status).includes(term);
+        if (!hit) return false;
+      }
+      return matchesColumnFilters(c, colFilters, now);
+    });
+  }, [connections, filter, colFilters]);
 
   return (
     <Box sx={{ display: 'flex', height: 'calc(100vh - 80px)' }}>
@@ -159,13 +548,18 @@ export default function ConnectionsPage() {
           <Table size='small' stickyHeader>
             <TableHead>
               <TableRow>
-                <TableCell width={70}>Method</TableCell>
+                <TableCell width={120}>Method</TableCell>
                 <TableCell>URL</TableCell>
-                <TableCell width={70}>Status</TableCell>
-                <TableCell width={140}>Duration</TableCell>
-                <TableCell width={80}>Size</TableCell>
-                <TableCell width={80}>Time</TableCell>
+                <TableCell width={90}>Status</TableCell>
+                <TableCell width={170}>Duration</TableCell>
+                <TableCell width={130}>Size</TableCell>
+                <TableCell width={130}>Time</TableCell>
               </TableRow>
+              <FilterRow
+                filters={colFilters}
+                setFilters={setColFilters}
+                onReset={() => setColFilters(DEFAULT_FILTERS)}
+              />
             </TableHead>
             <TableBody>
               {filtered.length === 0 && (
@@ -264,94 +658,492 @@ export default function ConnectionsPage() {
         anchor='right'
         open={!!selected}
         onClose={() => setSelected(null)}
-        sx={{ '& .MuiDrawer-paper': { width: 420, p: 2 } }}>
+        sx={{ '& .MuiDrawer-paper': { width: 520, p: 2 } }}>
         {selected && (
-          <Box>
-            <Typography variant='h6' gutterBottom>
-              {selected.method} {selected.path}
-            </Typography>
-            <Chip
-              label={selected.status ?? 'pending'}
-              color={statusColor(selected.status)}
-              sx={{ mb: 2 }}
-            />
-
-            <Typography variant='subtitle2' sx={{ mt: 2, mb: 1 }}>
-              General
-            </Typography>
-            <DetailRow
-              label='Intercepted'
-              value={selected.intercepted ? 'yes' : 'no'}
-              highlight={selected.intercepted}
-            />
-            <DetailRow
-              label='Blocked'
-              value={selected.blocked ? 'yes' : 'no'}
-              highlight={!!selected.blocked}
-            />
-            <DetailRow label='URL' value={selected.url} />
-            <DetailRow label='Host' value={selected.host} />
-            <DetailRow label='Duration' value={formatDuration(selected.duration_ms)} />
-            <DetailRow label='Request Size' value={formatBytes(selected.request_size)} />
-            <DetailRow label='Response Size' value={formatBytes(selected.response_size)} />
-            <DetailRow label='Content-Type' value={selected.content_type ?? '-'} />
-            <DetailRow label='Timestamp' value={new Date(selected.timestamp).toLocaleString()} />
-
-            {selected.request_headers.length > 0 && (
-              <>
-                <Typography variant='subtitle2' sx={{ mt: 2, mb: 1 }}>
-                  Request Headers
-                </Typography>
-                {selected.request_headers.map(([k, v], i) => (
-                  <DetailRow key={i} label={k} value={v} />
-                ))}
-              </>
-            )}
-
-            {selected.response_headers.length > 0 && (
-              <>
-                <Typography variant='subtitle2' sx={{ mt: 2, mb: 1 }}>
-                  Response Headers
-                </Typography>
-                {selected.response_headers.map(([k, v], i) => (
-                  <DetailRow key={i} label={k} value={v} />
-                ))}
-              </>
-            )}
-
-            {selected.request_body && (
-              <>
-                <Typography variant='subtitle2' sx={{ mt: 2, mb: 1 }}>
-                  Request Body
-                </Typography>
-                <Card variant='outlined'>
-                  <CardContent>
-                    <pre style={{ margin: 0, fontSize: '0.8em', whiteSpace: 'pre-wrap' }}>
-                      {selected.request_body}
-                    </pre>
-                  </CardContent>
-                </Card>
-              </>
-            )}
-
-            {selected.response_body && (
-              <>
-                <Typography variant='subtitle2' sx={{ mt: 2, mb: 1 }}>
-                  Response Body
-                </Typography>
-                <Card variant='outlined'>
-                  <CardContent>
-                    <pre style={{ margin: 0, fontSize: '0.8em', whiteSpace: 'pre-wrap' }}>
-                      {selected.response_body}
-                    </pre>
-                  </CardContent>
-                </Card>
-              </>
-            )}
-          </Box>
+          <DetailDrawerContent
+            conn={selected}
+            onToast={(t) => setToast(t)}
+          />
         )}
       </Drawer>
+
+      <Snackbar
+        open={!!toast}
+        autoHideDuration={3000}
+        onClose={() => setToast(null)}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}>
+        {toast ? (
+          <Alert severity={toast.kind} onClose={() => setToast(null)} sx={{ width: '100%' }}>
+            {toast.msg}
+          </Alert>
+        ) : undefined}
+      </Snackbar>
     </Box>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Filter row (rendered as a TableRow inside TableHead)
+// ---------------------------------------------------------------------------
+
+function FilterRow({
+  filters,
+  setFilters,
+  onReset,
+}: {
+  filters: ColumnFilters;
+  setFilters: (next: ColumnFilters) => void;
+  onReset: () => void;
+}) {
+  const onMethods = (e: SelectChangeEvent<string[]>) =>
+    setFilters({ ...filters, methods: typeof e.target.value === 'string' ? [] : e.target.value });
+  const onStatuses = (e: SelectChangeEvent<string[]>) =>
+    setFilters({
+      ...filters,
+      statusBuckets: typeof e.target.value === 'string' ? [] : e.target.value,
+    });
+  const hasAnyFilter =
+    filters.methods.length +
+      filters.statusBuckets.length +
+      (filters.urlContains.trim() ? 1 : 0) +
+      (filters.durationValue.trim() ? 1 : 0) +
+      (filters.sizeValue.trim() ? 1 : 0) +
+      (filters.timeWindowMs != null ? 1 : 0) >
+    0;
+
+  return (
+    <TableRow data-testid='column-filter-row' sx={{ '& > th': { py: 0.5 } }}>
+      <TableCell>
+        <FormControl size='small' fullWidth>
+          <Select
+            data-testid='method-filter'
+            multiple
+            displayEmpty
+            value={filters.methods}
+            onChange={onMethods}
+            input={<OutlinedInput sx={{ fontSize: '0.75rem' }} />}
+            renderValue={(s) => (s.length === 0 ? 'Any' : s.join(','))}>
+            {METHOD_OPTIONS.map((m) => (
+              <MenuItem key={m} value={m}>
+                {m}
+              </MenuItem>
+            ))}
+          </Select>
+        </FormControl>
+      </TableCell>
+      <TableCell>
+        <TextField
+          data-testid='url-filter'
+          placeholder='contains...'
+          value={filters.urlContains}
+          onChange={(e) => setFilters({ ...filters, urlContains: e.target.value })}
+          size='small'
+          fullWidth
+          slotProps={{ htmlInput: { style: { fontSize: '0.75rem', padding: 6 } } }}
+        />
+        {hasAnyFilter && (
+          <Button
+            data-testid='reset-filters'
+            size='small'
+            onClick={onReset}
+            sx={{ mt: 0.5, fontSize: '0.65rem', minWidth: 0, py: 0 }}>
+            reset filters
+          </Button>
+        )}
+      </TableCell>
+      <TableCell>
+        <FormControl size='small' fullWidth>
+          <Select
+            data-testid='status-filter'
+            multiple
+            displayEmpty
+            value={filters.statusBuckets}
+            onChange={onStatuses}
+            input={<OutlinedInput sx={{ fontSize: '0.75rem' }} />}
+            renderValue={(s) => (s.length === 0 ? 'Any' : s.join(','))}>
+            {STATUS_BUCKETS.map((b) => (
+              <MenuItem key={b.label} value={b.label}>
+                {b.label}
+              </MenuItem>
+            ))}
+          </Select>
+        </FormControl>
+      </TableCell>
+      <TableCell>
+        <Stack direction='row' spacing={0.5}>
+          <Select
+            data-testid='duration-op'
+            size='small'
+            value={filters.durationOp}
+            onChange={(e) =>
+              setFilters({ ...filters, durationOp: e.target.value as Op })
+            }
+            sx={{ fontSize: '0.75rem', width: 60 }}>
+            <MenuItem value='>='>≥</MenuItem>
+            <MenuItem value='<='>≤</MenuItem>
+          </Select>
+          <TextField
+            data-testid='duration-value'
+            placeholder='ms'
+            size='small'
+            value={filters.durationValue}
+            onChange={(e) => setFilters({ ...filters, durationValue: e.target.value })}
+            slotProps={{
+              htmlInput: { inputMode: 'numeric', style: { fontSize: '0.75rem', padding: 6 } },
+            }}
+          />
+        </Stack>
+      </TableCell>
+      <TableCell>
+        <Stack direction='row' spacing={0.5}>
+          <Select
+            data-testid='size-op'
+            size='small'
+            value={filters.sizeOp}
+            onChange={(e) => setFilters({ ...filters, sizeOp: e.target.value as Op })}
+            sx={{ fontSize: '0.75rem', width: 60 }}>
+            <MenuItem value='>='>≥</MenuItem>
+            <MenuItem value='<='>≤</MenuItem>
+          </Select>
+          <TextField
+            data-testid='size-value'
+            placeholder='B'
+            size='small'
+            value={filters.sizeValue}
+            onChange={(e) => setFilters({ ...filters, sizeValue: e.target.value })}
+            slotProps={{
+              htmlInput: { inputMode: 'numeric', style: { fontSize: '0.75rem', padding: 6 } },
+            }}
+          />
+        </Stack>
+      </TableCell>
+      <TableCell>
+        <FormControl size='small' fullWidth>
+          <Select
+            data-testid='time-window'
+            value={filters.timeWindowMs == null ? '' : String(filters.timeWindowMs)}
+            onChange={(e) => {
+              const v = e.target.value;
+              setFilters({ ...filters, timeWindowMs: v === '' ? null : Number(v) });
+            }}
+            displayEmpty
+            sx={{ fontSize: '0.75rem' }}>
+            {TIME_WINDOWS.map((w) => (
+              <MenuItem key={w.label} value={w.ms == null ? '' : String(w.ms)}>
+                {w.label}
+              </MenuItem>
+            ))}
+          </Select>
+        </FormControl>
+      </TableCell>
+    </TableRow>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Detail drawer content (extracted so we can keep per-drawer local state for
+// formatted/raw body toggle and codegen language)
+// ---------------------------------------------------------------------------
+
+function DetailDrawerContent({
+  conn,
+  onToast,
+}: {
+  conn: ConnectionLog;
+  onToast: (t: { kind: 'success' | 'error' | 'info'; msg: string }) => void;
+}) {
+  const [reqDisplay, setReqDisplay] = useState<string | null>(null);
+  const [respDisplay, setRespDisplay] = useState<string | null>(null);
+  const [codegenLang, setCodegenLang] = useState<CodegenLang>('curl');
+  // Reset overrides when switching rows.
+  const connId = conn.id;
+  useEffect(() => {
+    setReqDisplay(null);
+    setRespDisplay(null);
+  }, [connId]);
+
+  const reqDecoded = decodeBody(conn.request_body, conn.content_type);
+  const respDecoded = decodeBody(
+    conn.response_body,
+    headerLookup(conn.response_headers, 'content-type') ?? conn.content_type,
+  );
+
+  const generatedCode = useMemo(() => generateCode(conn, codegenLang), [conn, codegenLang]);
+
+  return (
+    <Box>
+      <Typography variant='h6' gutterBottom>
+        {conn.method} {conn.path}
+      </Typography>
+      <Chip label={conn.status ?? 'pending'} color={statusColor(conn.status)} sx={{ mb: 2 }} />
+
+      <Typography variant='subtitle2' sx={{ mt: 2, mb: 1 }}>
+        General
+      </Typography>
+      <DetailRow
+        label='Intercepted'
+        value={conn.intercepted ? 'yes' : 'no'}
+        highlight={conn.intercepted}
+      />
+      <DetailRow
+        label='Blocked'
+        value={conn.blocked ? 'yes' : 'no'}
+        highlight={!!conn.blocked}
+      />
+      <DetailRow label='URL' value={conn.url} />
+      <DetailRow label='Host' value={conn.host} />
+      <DetailRow label='Duration' value={formatDuration(conn.duration_ms)} />
+      <DetailRow label='Request Size' value={formatBytes(conn.request_size)} />
+      <DetailRow label='Response Size' value={formatBytes(conn.response_size)} />
+      <DetailRow label='Content-Type' value={conn.content_type ?? '-'} />
+      <DetailRow label='Timestamp' value={new Date(conn.timestamp).toLocaleString()} />
+
+      {conn.request_headers.length > 0 && (
+        <>
+          <Typography variant='subtitle2' sx={{ mt: 2, mb: 1 }}>
+            Request Headers
+          </Typography>
+          {conn.request_headers.map(([k, v], i) => (
+            <DetailRow key={i} label={k} value={v} />
+          ))}
+        </>
+      )}
+
+      {conn.response_headers.length > 0 && (
+        <>
+          <Typography variant='subtitle2' sx={{ mt: 2, mb: 1 }}>
+            Response Headers
+          </Typography>
+          {conn.response_headers.map(([k, v], i) => (
+            <DetailRow key={i} label={k} value={v} />
+          ))}
+        </>
+      )}
+
+      {reqDecoded && (
+        <BodySection
+          title='Request Body'
+          decoded={reqDecoded}
+          override={reqDisplay}
+          onFormat={() => {
+            if (reqDecoded.isDataUri) {
+              onToast({ kind: 'info', msg: 'Cannot format a binary body.' });
+              return;
+            }
+            const out = formatByMime(reqDecoded.text, reqDecoded.mime);
+            if (out == null) {
+              onToast({ kind: 'error', msg: `No formatter available for ${reqDecoded.mime}.` });
+              return;
+            }
+            setReqDisplay(out);
+            onToast({ kind: 'success', msg: 'Body formatted.' });
+          }}
+          onSave={() => {
+            const name = inferFilename(conn.url, reqDecoded.mime, 'request');
+            if (reqDecoded.isDataUri) downloadFromDataUri(reqDecoded.dataUri, name);
+            else downloadFromString(reqDisplay ?? reqDecoded.text, reqDecoded.mime, name);
+            onToast({ kind: 'success', msg: `Saving ${name}…` });
+          }}
+        />
+      )}
+
+      {respDecoded && (
+        <BodySection
+          title='Response Body'
+          decoded={respDecoded}
+          override={respDisplay}
+          onFormat={() => {
+            if (respDecoded.isDataUri) {
+              onToast({ kind: 'info', msg: 'Cannot format a binary body.' });
+              return;
+            }
+            const out = formatByMime(respDecoded.text, respDecoded.mime);
+            if (out == null) {
+              onToast({ kind: 'error', msg: `No formatter available for ${respDecoded.mime}.` });
+              return;
+            }
+            setRespDisplay(out);
+            onToast({ kind: 'success', msg: 'Body formatted.' });
+          }}
+          onSave={() => {
+            const name = inferFilename(conn.url, respDecoded.mime, 'response');
+            if (respDecoded.isDataUri) downloadFromDataUri(respDecoded.dataUri, name);
+            else downloadFromString(respDisplay ?? respDecoded.text, respDecoded.mime, name);
+            onToast({ kind: 'success', msg: `Saving ${name}…` });
+          }}
+        />
+      )}
+
+      <Typography variant='subtitle2' sx={{ mt: 3, mb: 1 }}>
+        Generate code
+      </Typography>
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+        <FormControl size='small'>
+          <Select
+            data-testid='codegen-lang'
+            value={codegenLang}
+            onChange={(e) => setCodegenLang(e.target.value as CodegenLang)}
+            sx={{ fontSize: '0.8rem' }}>
+            <MenuItem value='curl'>curl</MenuItem>
+            <MenuItem value='python'>python (requests)</MenuItem>
+            <MenuItem value='node'>node (fetch)</MenuItem>
+          </Select>
+        </FormControl>
+        <Tooltip title='Copy to clipboard'>
+          <IconButton
+            size='small'
+            data-testid='codegen-copy'
+            onClick={async () => {
+              try {
+                await navigator.clipboard.writeText(generatedCode);
+                onToast({ kind: 'success', msg: 'Copied to clipboard.' });
+              } catch (e) {
+                onToast({ kind: 'error', msg: `Copy failed: ${String(e)}` });
+              }
+            }}>
+            <ContentCopyIcon fontSize='small' />
+          </IconButton>
+        </Tooltip>
+      </Box>
+      <Card variant='outlined' data-testid='codegen-output'>
+        <CardContent sx={{ p: 1, '&:last-child': { pb: 1 } }}>
+          <pre style={{ margin: 0, fontSize: '0.75em', whiteSpace: 'pre-wrap' }}>
+            {generatedCode}
+          </pre>
+        </CardContent>
+      </Card>
+    </Box>
+  );
+}
+
+function headerLookup(headers: [string, string][], name: string): string | null {
+  const lower = name.toLowerCase();
+  const match = headers.find(([k]) => k.toLowerCase() === lower);
+  return match ? match[1] : null;
+}
+
+// ---------------------------------------------------------------------------
+// BodySection — renders preview (text vs image/video/audio/iframe) + actions.
+// ---------------------------------------------------------------------------
+
+function BodySection({
+  title,
+  decoded,
+  override,
+  onFormat,
+  onSave,
+}: {
+  title: string;
+  decoded: DecodedBody;
+  override: string | null;
+  onFormat: () => void;
+  onSave: () => void;
+}) {
+  const showText = !decoded.isDataUri;
+  const canFormat = showText && isFormatterMime(decoded.mime);
+
+  return (
+    <>
+      <Box sx={{ display: 'flex', alignItems: 'center', mt: 2, mb: 1, gap: 1 }}>
+        <Typography variant='subtitle2' sx={{ flexGrow: 1 }}>
+          {title}
+        </Typography>
+        {canFormat && (
+          <Tooltip title='Pretty-print this body'>
+            <Button
+              size='small'
+              data-testid={`${title.toLowerCase().replace(' ', '-')}-format`}
+              startIcon={<AutoFixHighIcon fontSize='small' />}
+              onClick={onFormat}>
+              Format
+            </Button>
+          </Tooltip>
+        )}
+        <Tooltip title='Save to a local file'>
+          <Button
+            size='small'
+            data-testid={`${title.toLowerCase().replace(' ', '-')}-save`}
+            startIcon={<DownloadIcon fontSize='small' />}
+            onClick={onSave}>
+            Save
+          </Button>
+        </Tooltip>
+      </Box>
+      <Card variant='outlined'>
+        <CardContent sx={{ p: 1, '&:last-child': { pb: 1 } }}>
+          <BodyPreview decoded={decoded} override={override} />
+        </CardContent>
+      </Card>
+    </>
+  );
+}
+
+function BodyPreview({
+  decoded,
+  override,
+}: {
+  decoded: DecodedBody;
+  override: string | null;
+}) {
+  if (decoded.isDataUri) {
+    const m = decoded.mime.toLowerCase();
+    if (m.startsWith('image/')) {
+      return (
+        <img
+          data-testid='body-preview-image'
+          src={decoded.dataUri}
+          alt='response body'
+          style={{ maxWidth: '100%', display: 'block' }}
+        />
+      );
+    }
+    if (m.startsWith('video/')) {
+      return (
+        <video
+          data-testid='body-preview-video'
+          controls
+          src={decoded.dataUri}
+          style={{ maxWidth: '100%', display: 'block' }}
+        />
+      );
+    }
+    if (m.startsWith('audio/')) {
+      return (
+        <audio
+          data-testid='body-preview-audio'
+          controls
+          src={decoded.dataUri}
+          style={{ width: '100%', display: 'block' }}
+        />
+      );
+    }
+    if (m === 'application/pdf') {
+      return (
+        <iframe
+          data-testid='body-preview-pdf'
+          title='response body'
+          src={decoded.dataUri}
+          style={{ width: '100%', height: 320, border: 0 }}
+        />
+      );
+    }
+    return (
+      <Typography
+        data-testid='body-preview-binary-placeholder'
+        variant='caption'
+        color='text.secondary'>
+        Binary content — {decoded.mime} ({formatBytes(decoded.byteLength)}). Use "Save" to
+        download.
+      </Typography>
+    );
+  }
+
+  return (
+    <pre
+      data-testid='body-preview-text'
+      style={{ margin: 0, fontSize: '0.8em', whiteSpace: 'pre-wrap' }}>
+      {override ?? decoded.text}
+    </pre>
   );
 }
 

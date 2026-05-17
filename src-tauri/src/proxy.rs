@@ -304,7 +304,17 @@ async fn mitm_connect(
     let mut tls_client = match acceptor.accept(client_stream).await {
         Ok(s) => s,
         Err(e) => {
-            // Most common cause: client doesn't trust the CA.
+            // Two common causes:
+            // 1) Client doesn't trust the Proxie CA (system trust store
+            //    install missing or stale) → typically surfaces as
+            //    "alert bad certificate" or "alert unknown ca".
+            // 2) Client uses *certificate pinning* and intentionally
+            //    rejects any cert outside its hardcoded pin set →
+            //    typically surfaces as "tls handshake eof": the client
+            //    aborts the handshake without sending an alert. Apple's
+            //    iCloud daemon (gateway.icloud.com), APNS, the App
+            //    Store, and most banking apps all pin and are
+            //    fundamentally un-MITMable from a proxy.
             log_mitm_failure(
                 state,
                 app_handle,
@@ -312,7 +322,8 @@ async fn mitm_connect(
                 target,
                 start,
                 &format!(
-                    "TLS handshake with client failed (is the Proxie CA trusted?): {}",
+                    "TLS handshake with client failed ({}): {}",
+                    classify_tls_failure(&e),
                     e
                 ),
             )
@@ -748,10 +759,23 @@ pub fn rewrite_for_upstream(request_data: &[u8], host: &str) -> Vec<u8> {
 
 /// Parse a raw HTTP response byte buffer into the pieces we log.
 ///
+/// As of v0.4.3 this also decodes the body so the Connections drawer can
+/// render it usefully:
+/// - chunked `Transfer-Encoding` is unwrapped into a flat byte stream;
+/// - `Content-Encoding: gzip | deflate | br` is decompressed (any failure
+///   falls back silently to the raw bytes);
+/// - text content types (`text/*`, JSON, XML, JavaScript, urlencoded form)
+///   are returned as UTF-8 strings (lossy);
+/// - binary content types (images, video, audio, fonts, PDFs, application/
+///   octet-stream, unrecognized MIME) are base64-encoded as a `data:<mime>;
+///   base64,...` URI so the frontend can drop them straight into `<img>` /
+///   `<video>` / etc.
+///
 /// # Returns
-/// `(status, headers, body_text, content_type)` — all optional fields
-/// fall back to `None` when the response can't be parsed (truncated, non-
-/// text body, etc).
+/// `(status, headers, body_text, content_type)` — `body_text` is `None`
+/// when the response has no body separator, an empty string when the body
+/// section is present but empty, or a (potentially data-URI) string for
+/// everything else.
 #[allow(clippy::type_complexity)]
 pub fn parse_response(
     buf: &[u8],
@@ -761,14 +785,18 @@ pub fn parse_response(
     Option<String>,
     Option<String>,
 ) {
-    let s = String::from_utf8_lossy(buf);
-    let header_end = s.find("\r\n\r\n");
-    let head = match header_end {
-        Some(idx) => &s[..idx],
-        None => &s[..],
+    // Locate the header / body boundary on raw bytes so we don't truncate
+    // binary payloads via String::from_utf8_lossy.
+    let header_end = find_header_end(buf);
+    let head_bytes = match header_end {
+        Some(idx) => &buf[..idx],
+        None => buf,
     };
-    let body = header_end.map(|idx| s[idx + 4..].to_string());
+    let body_bytes_raw: Option<&[u8]> = header_end.map(|idx| &buf[idx + 4..]);
 
+    // Headers are ASCII-only by RFC, so utf8_lossy on the header slice is
+    // safe and matches the historical parser shape.
+    let head = String::from_utf8_lossy(head_bytes);
     let mut lines = head.lines();
     let status_line = lines.next().unwrap_or("");
     let status = status_line
@@ -778,15 +806,198 @@ pub fn parse_response(
 
     let mut headers: Vec<(String, String)> = Vec::new();
     let mut content_type: Option<String> = None;
+    let mut content_encoding: Option<String> = None;
+    let mut transfer_encoding: Option<String> = None;
     for line in lines {
         if let Some((k, v)) = line.split_once(": ") {
             if k.eq_ignore_ascii_case("content-type") {
                 content_type = Some(v.to_string());
+            } else if k.eq_ignore_ascii_case("content-encoding") {
+                content_encoding = Some(v.to_string());
+            } else if k.eq_ignore_ascii_case("transfer-encoding") {
+                transfer_encoding = Some(v.to_string());
             }
             headers.push((k.to_string(), v.to_string()));
         }
     }
+
+    let body = body_bytes_raw.map(|raw| {
+        let dechunked = if transfer_encoding
+            .as_deref()
+            .map(|te| te.to_ascii_lowercase().contains("chunked"))
+            .unwrap_or(false)
+        {
+            decode_chunked(raw).unwrap_or_else(|| raw.to_vec())
+        } else {
+            raw.to_vec()
+        };
+
+        let decoded = match content_encoding.as_deref().map(|s| s.to_ascii_lowercase()) {
+            Some(ref e) if e == "gzip" || e == "x-gzip" => decompress_gzip(&dechunked)
+                .unwrap_or(dechunked),
+            Some(ref e) if e == "deflate" => decompress_deflate(&dechunked)
+                .unwrap_or(dechunked),
+            Some(ref e) if e == "br" => decompress_brotli(&dechunked)
+                .unwrap_or(dechunked),
+            _ => dechunked,
+        };
+
+        encode_body_for_log(&decoded, content_type.as_deref())
+    });
+
     (status, headers, body, content_type)
+}
+
+/// Byte-level search for the `\r\n\r\n` header / body separator. Returns the
+/// index of the first `\r` so callers can slice `buf[..idx]` for headers
+/// and `buf[idx + 4..]` for the body.
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+/// Decode HTTP/1.1 chunked transfer-encoding into a flat byte vector.
+///
+/// Returns `None` on any malformed input (the caller then falls back to
+/// the raw bytes — preserving prior behavior for the "we can't parse it,
+/// just show what we have" case).
+fn decode_chunked(buf: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(buf.len());
+    let mut i = 0usize;
+    while i < buf.len() {
+        // Find CRLF terminating the size line.
+        let line_end = buf[i..].windows(2).position(|w| w == b"\r\n")? + i;
+        let size_line = std::str::from_utf8(&buf[i..line_end]).ok()?;
+        // Strip any chunk extensions after ';'.
+        let size_hex = size_line.split(';').next()?.trim();
+        let size = usize::from_str_radix(size_hex, 16).ok()?;
+        i = line_end + 2;
+        if size == 0 {
+            return Some(out);
+        }
+        if i + size > buf.len() {
+            return None;
+        }
+        out.extend_from_slice(&buf[i..i + size]);
+        i += size;
+        // Each chunk is terminated by CRLF.
+        if i + 2 > buf.len() {
+            return None;
+        }
+        if &buf[i..i + 2] != b"\r\n" {
+            return None;
+        }
+        i += 2;
+    }
+    Some(out)
+}
+
+fn decompress_gzip(data: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut decoder = flate2::read::GzDecoder::new(data);
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).ok()?;
+    Some(out)
+}
+
+fn decompress_deflate(data: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    // Try raw deflate first, then zlib-wrapped — servers vary on which they
+    // mean when they say "deflate" (Microsoft IIS notoriously sends raw).
+    let mut out = Vec::new();
+    let mut zlib = flate2::read::ZlibDecoder::new(data);
+    if zlib.read_to_end(&mut out).is_ok() {
+        return Some(out);
+    }
+    out.clear();
+    let mut raw = flate2::read::DeflateDecoder::new(data);
+    raw.read_to_end(&mut out).ok()?;
+    Some(out)
+}
+
+fn decompress_brotli(data: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut decoder = brotli::Decompressor::new(data, 4096);
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).ok()?;
+    Some(out)
+}
+
+/// Heuristic: should this content-type be shown as plain text?
+fn is_text_content_type(ct: Option<&str>) -> bool {
+    let Some(ct) = ct else {
+        return true; // unknown ⇒ try text first (matches v0.4.2 behavior)
+    };
+    let ct = ct.to_ascii_lowercase();
+    let base = ct.split(';').next().unwrap_or("").trim();
+    if base.starts_with("text/") {
+        return true;
+    }
+    matches!(
+        base,
+        "application/json"
+            | "application/ld+json"
+            | "application/javascript"
+            | "application/x-javascript"
+            | "application/ecmascript"
+            | "application/xml"
+            | "application/xhtml+xml"
+            | "application/x-www-form-urlencoded"
+            | "application/graphql"
+            | "application/problem+json"
+            | "application/vnd.api+json"
+            | "application/x-yaml"
+            | "application/yaml"
+    ) || base.ends_with("+json")
+        || base.ends_with("+xml")
+}
+
+/// Render a decoded body slice into the string we ship to the frontend.
+///
+/// Text-like content types come through as UTF-8 (lossy). Binary content
+/// types are emitted as `data:<mime>;base64,...` URIs so `<img>` / `<video>`
+/// / `<audio>` elements in the Connections drawer can render them directly.
+fn encode_body_for_log(decoded: &[u8], content_type: Option<&str>) -> String {
+    if decoded.is_empty() {
+        return String::new();
+    }
+    if is_text_content_type(content_type) {
+        return String::from_utf8_lossy(decoded).into_owned();
+    }
+    use base64::Engine as _;
+    let mime = content_type
+        .and_then(|c| c.split(';').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("application/octet-stream");
+    let b64 = base64::engine::general_purpose::STANDARD.encode(decoded);
+    format!("data:{};base64,{}", mime, b64)
+}
+
+/// Map a rustls handshake-accept error into a short human-readable note
+/// for the connection-log body.
+///
+/// We can't reliably introspect [`std::io::Error`] / `rustls::Error` enums
+/// here because the accept path returns a `std::io::Error` whose inner
+/// payload varies by rustls version — instead we inspect the `Display` text
+/// for the two failure shapes that matter to users.
+pub fn classify_tls_failure(err: &std::io::Error) -> &'static str {
+    let s = err.to_string().to_ascii_lowercase();
+    if s.contains("eof") || s.contains("unexpected end of file") || s.contains("peer closed") {
+        // Client tore down the handshake without sending an alert. Pinning
+        // clients (Apple iCloud / APNS / App Store / banking apps) almost
+        // always look like this.
+        "likely certificate pinning — common for iCloud, App Store, banking apps; cannot be MITM-ed"
+    } else if s.contains("bad certificate")
+        || s.contains("unknown ca")
+        || s.contains("unknown_ca")
+        || s.contains("certificate unknown")
+        || s.contains("self-signed")
+        || s.contains("self signed")
+    {
+        "is the Proxie CA installed in this client's trust store?"
+    } else {
+        "is the Proxie CA trusted?"
+    }
 }
 
 async fn handle_http_request(
@@ -2027,5 +2238,171 @@ mod tests {
         let s = String::from_utf8(resp).unwrap();
         assert!(s.contains("Content-Length: 0\r\n"));
         assert!(s.ends_with("\r\n\r\n"));
+    }
+
+    // ---------------------------------------------------------------
+    // v0.4.3 — parse_response decoding (chunked / gzip / br / binary)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_is_text_content_type_covers_common_text_mimes() {
+        assert!(is_text_content_type(Some("text/html")));
+        assert!(is_text_content_type(Some("text/plain; charset=utf-8")));
+        assert!(is_text_content_type(Some("application/json")));
+        assert!(is_text_content_type(Some("application/json; charset=utf-8")));
+        assert!(is_text_content_type(Some("application/javascript")));
+        assert!(is_text_content_type(Some("application/xml")));
+        assert!(is_text_content_type(Some("application/vnd.api+json")));
+        assert!(is_text_content_type(Some("image/svg+xml")));
+        // Unknown content type defaults to text (preserves pre-v0.4.3 shape).
+        assert!(is_text_content_type(None));
+        // Binary types
+        assert!(!is_text_content_type(Some("image/png")));
+        assert!(!is_text_content_type(Some("image/jpeg")));
+        assert!(!is_text_content_type(Some("video/mp4")));
+        assert!(!is_text_content_type(Some("application/octet-stream")));
+        assert!(!is_text_content_type(Some("application/pdf")));
+    }
+
+    #[test]
+    fn test_encode_body_binary_emits_data_uri() {
+        let png_magic = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        let out = encode_body_for_log(&png_magic, Some("image/png"));
+        assert!(out.starts_with("data:image/png;base64,"));
+        // The decoded base64 must round-trip back to the original bytes.
+        use base64::Engine as _;
+        let b64 = out.strip_prefix("data:image/png;base64,").unwrap();
+        let back = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        assert_eq!(back, png_magic);
+    }
+
+    #[test]
+    fn test_encode_body_text_returns_utf8_string() {
+        let out = encode_body_for_log(b"{\"ok\":true}", Some("application/json"));
+        assert_eq!(out, "{\"ok\":true}");
+    }
+
+    #[test]
+    fn test_decode_chunked_basic() {
+        // RFC 7230 example: two chunks then 0-length terminator.
+        let raw = b"5\r\nHello\r\n6\r\n World\r\n0\r\n";
+        let out = decode_chunked(raw).expect("valid chunked input");
+        assert_eq!(out, b"Hello World");
+    }
+
+    #[test]
+    fn test_decode_chunked_with_extension() {
+        // Chunk extension after ';' should be tolerated.
+        let raw = b"5;ext=foo\r\nHello\r\n0\r\n";
+        let out = decode_chunked(raw).expect("valid chunked input with ext");
+        assert_eq!(out, b"Hello");
+    }
+
+    #[test]
+    fn test_decode_chunked_malformed_returns_none() {
+        // Missing CRLF after chunk data.
+        let raw = b"5\r\nHello0\r\n";
+        assert!(decode_chunked(raw).is_none());
+    }
+
+    #[test]
+    fn test_parse_response_decompresses_gzip_text() {
+        use flate2::write::GzEncoder;
+        use std::io::Write as _;
+        let mut enc = GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(b"{\"hello\":\"world\"}").unwrap();
+        let compressed = enc.finish().unwrap();
+
+        let mut raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\n\r\n".to_vec();
+        raw.extend_from_slice(&compressed);
+
+        let (status, _h, body, ct) = parse_response(&raw);
+        assert_eq!(status, Some(200));
+        assert_eq!(ct.as_deref(), Some("application/json"));
+        assert_eq!(body.as_deref(), Some("{\"hello\":\"world\"}"));
+    }
+
+    #[test]
+    fn test_parse_response_decompresses_brotli_text() {
+        let mut compressed = Vec::new();
+        {
+            use std::io::Write as _;
+            let mut writer =
+                brotli::CompressorWriter::new(&mut compressed, 4096, 5, 22);
+            writer.write_all(b"<h1>hello</h1>").unwrap();
+        }
+        let mut raw =
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Encoding: br\r\n\r\n".to_vec();
+        raw.extend_from_slice(&compressed);
+
+        let (_status, _h, body, _ct) = parse_response(&raw);
+        assert_eq!(body.as_deref(), Some("<h1>hello</h1>"));
+    }
+
+    #[test]
+    fn test_parse_response_dechunks_then_returns_body() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHello\r\n6\r\n World\r\n0\r\n";
+        let (_status, _h, body, _ct) = parse_response(raw);
+        assert_eq!(body.as_deref(), Some("Hello World"));
+    }
+
+    #[test]
+    fn test_parse_response_binary_emits_data_uri() {
+        // GIF89a magic bytes — a known-binary content type. The parser
+        // must base64-encode them and prefix with the data: URI scheme
+        // so the frontend can render via <img>.
+        let mut raw = b"HTTP/1.1 200 OK\r\nContent-Type: image/gif\r\n\r\n".to_vec();
+        let body_bytes: &[u8] = &[
+            0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x00,
+        ];
+        raw.extend_from_slice(body_bytes);
+
+        let (_status, _h, body, _ct) = parse_response(&raw);
+        let body = body.expect("body present");
+        assert!(body.starts_with("data:image/gif;base64,"));
+    }
+
+    #[test]
+    fn test_parse_response_unknown_content_encoding_falls_back_to_raw() {
+        // An unknown Content-Encoding must NOT panic — fall back to the
+        // raw bytes as text (then base64 if binary content-type).
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Encoding: pied-piper\r\n\r\nhello";
+        let (_status, _h, body, _ct) = parse_response(raw);
+        assert_eq!(body.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn test_classify_tls_failure_eof_marks_pinning() {
+        let e = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "tls handshake eof");
+        let note = classify_tls_failure(&e);
+        assert!(
+            note.contains("pinning"),
+            "EOF should be classified as pinning, got: {}",
+            note
+        );
+    }
+
+    #[test]
+    fn test_classify_tls_failure_bad_certificate_marks_trust_store() {
+        let e = std::io::Error::other("alert bad certificate received");
+        let note = classify_tls_failure(&e);
+        assert!(
+            note.contains("trust store"),
+            "bad certificate should be classified as trust-store issue, got: {}",
+            note
+        );
+    }
+
+    #[test]
+    fn test_classify_tls_failure_unknown_falls_back() {
+        let e = std::io::Error::other("something else entirely");
+        let note = classify_tls_failure(&e);
+        assert!(
+            note.contains("CA"),
+            "unknown errors should still hint at the CA, got: {}",
+            note
+        );
     }
 }

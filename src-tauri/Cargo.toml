@@ -1,6 +1,6 @@
 [package]
 name = "proxie"
-version = "0.4.2"
+version = "0.4.3"
 description = "A lightweight HTTPS proxy interceptor"
 authors = ["Sy Le"]
 edition = "2021"
@@ -30,6 +30,14 @@ rustls-pemfile = "2"
 rustls-native-certs = "0.8"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
+# Response-body decoding (v0.4.3): proxies see gzip / deflate / brotli /
+# chunked encoded payloads in the wild. Decompressing them server-side keeps
+# the Connections drawer readable instead of dumping replacement-character
+# soup. base64 lets us safely round-trip binary bodies (images, videos,
+# fonts, etc.) into the frontend as `data:` URIs.
+flate2 = "1"
+brotli = "8"
+base64 = "0.22"
 
 # Test-only dependencies for the integration suite under `tests/`. These
 # never ship in the production binary — `cargo build` ignores them.
