@@ -1,4 +1,8 @@
-# Proxie — Claude Code Context
+# Proxie — Agent Context
+
+> This file is the single source of truth for both Claude Code and the GitHub
+> Copilot CLI. `.github/copilot-instructions.md` is a symlink to this file —
+> edit `CLAUDE.md` only.
 
 ## What is this project?
 
@@ -7,8 +11,8 @@ Proxie is a lightweight HTTPS proxy interceptor desktop app (like Charles Proxy,
 ## Tech stack
 
 - **Frontend:** React 19, TypeScript, MUI 9, Vite 6, React Router 7
-- **Backend:** Rust, Tauri v2, Tokio, Hyper, rcgen (cert generation)
-- **Tests:** Vitest + React Testing Library (frontend), cargo test (Rust)
+- **Backend:** Rust, Tauri v2, Tokio, Hyper, rcgen (cert generation), rustls / tokio-rustls, flate2 + brotli (response decompression), base64
+- **Tests:** Vitest + React Testing Library (frontend), `cargo test` (Rust)
 - **CI:** GitHub Actions on macOS ARM/Intel, Windows, Linux
 
 ## How to run
@@ -34,30 +38,33 @@ Dev (lldb-based, runs Rust + Vite together via the `ui:dev` task in
 src/                           # React frontend
   App.tsx                      # Routes + MUI theme
   components/Layout.tsx        # Shell: AppBar, nav drawer, proxy toggle
-  pages/ConnectionsPage.tsx    # Live traffic view + detail drawer
+  pages/ConnectionsPage.tsx    # Live traffic view + detail drawer (filters / preview / format / save / codegen)
   pages/HostRulesPage.tsx      # Host tracking CRUD
   pages/InterceptorPage.tsx    # Mock/reroute rule CRUD
+  pages/BlockRulesPage.tsx     # Pi-hole style block rules
   pages/SetupPage.tsx          # Proxy config + SSL cert management
   test/setup.ts                # Vitest setup with Tauri mocks
 
 src-tauri/src/                 # Rust backend
-  lib.rs                       # 17 Tauri commands + app setup
-  proxy.rs                     # HTTP/HTTPS proxy engine
+  lib.rs                       # Tauri commands + app setup
+  proxy.rs                     # HTTP/HTTPS proxy engine (parse_response decodes chunked / gzip / deflate / br, base64-encodes binary bodies as data: URIs)
   cert.rs                      # CA cert generation + install instructions
   state.rs                     # AppState, persistence, rule matching
-  types.rs                     # All data types (CertInfo, HostRule, InterceptRule, ConnectionLog, etc.)
+  tls.rs                       # MITM helpers: LeafCertCache, ServerConfig builder, native upstream connector
+  types.rs                     # All data types (CertInfo, HostRule, InterceptRule, BlockRule, ConnectionLog, etc.)
 ```
 
 ## Key conventions
 
 - All frontend-backend IPC uses Tauri `invoke()` commands
-- Tauri commands are defined in `lib.rs`, delegating to `state.rs`/`proxy.rs`/`cert.rs`
+- Tauri commands are defined in `lib.rs`, delegating to `state.rs` / `proxy.rs` / `cert.rs`
 - State is persisted to `~/.config/proxie/config.json` on every CRUD operation
 - Connections are in-memory only (max 10,000)
 - Intercept rules use HAR 1.2-inspired format for mock responses
 - `host_matches()` supports `*.example.com` wildcards
 - `path_matches()` supports `/api/*` and `/api/v*` wildcards
 - New fields on `PersistedState` must use `#[serde(default)]` for backward compatibility
+- `ConnectionLog.response_body` is either plain UTF-8 text or a `data:<mime>;base64,...` URI for binary content. The frontend detects the `data:` prefix to render `<img>` / `<video>` / `<audio>` / `<iframe>` instead of a corrupted `<pre>` blob.
 
 ## Testing
 
@@ -69,13 +76,22 @@ src-tauri/src/                 # Rust backend
 ## Build pipeline
 
 - CI config: `.github/workflows/build.yml`
-- Follows the same pattern as the `display-dj` project
 - 4-platform matrix: macOS ARM, macOS Intel, Windows, Linux
 - PR builds post artifact download links as comments
 
 ## Rust coverage gate
 
 The `coverage` job in `build.yml` runs `cargo llvm-cov --lib --summary-only` from `src-tauri/` on Linux and fails the build if lines / functions / regions drop below the v0.4.2 floored baseline (lines ≥ 42, functions ≥ 34, regions ≥ 45). HTML reports are uploaded as the `coverage-reports` artifact (14d retention) and the totals are appended to `$GITHUB_STEP_SUMMARY`. Raise these floors when coverage improves; never lower them.
+
+## Connections page UX (v0.4.3+)
+
+- Per-column filters live in the table header: method / status multi-selects, URL substring, duration / size numeric (operator + value), and a "time window" dropdown. The legacy free-text filter still exists as a global URL/host/method/status contains-search above the table.
+- Response body cards offer a **Format** button (JSON / HTML / XML / CSS / JS), a **Save** button (browser download via `Blob` + `URL.createObjectURL`, works inside the Tauri webview), and a code-generation dropdown that emits **curl**, **Python `requests`**, or **Node `fetch`** snippets so the request can be replayed from a terminal or test script.
+- Binary responses (`image/*`, `video/*`, `audio/*`, `application/pdf`) are stored as `data:` URIs by `parse_response` and rendered with the appropriate HTML media element. Everything else binary shows a "binary content (N bytes)" placeholder with a Save button.
+
+## Known MITM limitations
+
+Some clients pin their server certificates and will reject Proxie's CA even when it's installed in the system trust store. Apple's iCloud daemon (`gateway.icloud.com`), Apple Push Notification Service, the App Store, and most banking apps fall into this bucket — the TLS handshake closes with EOF before any data flows. Proxie surfaces this in the connection log as `"MITM error: TLS handshake with client failed (likely certificate pinning — common for iCloud, App Store, banking apps): ..."`. This is expected and cannot be fixed from the proxy side.
 
 ## GitHub Raw File URLs
 
@@ -96,7 +112,6 @@ Do NOT use:
 - **Add a new page:** Create in `src/pages/`, add route in `App.tsx`, add nav item in `Layout.tsx`
 - **Add a new persisted field:** Add to `PersistedState` with `#[serde(default)]`, add CRUD methods to `AppState`
 - **Add a new data type:** Define in `types.rs` with `Serialize, Deserialize`, add tests
-
 
 ## Git / PR Merge Policy
 
