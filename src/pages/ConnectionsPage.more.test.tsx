@@ -732,3 +732,116 @@ describe('ConnectionsPage — refresh / clear errors', () => {
     });
   });
 });
+
+describe('ConnectionsPage — body format / clipboard error toasts', () => {
+  const invokeMock = invoke as unknown as ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it('shows an error toast when clipboard.writeText rejects', async () => {
+    const user = userEvent.setup();
+    const writeText = vi.fn().mockRejectedValue(new Error('clipboard denied'));
+    Object.defineProperty(navigator, 'clipboard', {
+    configurable: true,
+    value: { writeText },
+    });
+    const row = makeConn({ method: 'GET', url: 'https://api.example.com/cperr' });
+    invokeMock.mockImplementation(async (cmd: string) => {
+    if (cmd === 'get_connections') return [row];
+    return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() =>
+    expect(screen.getByText('https://api.example.com/cperr')).toBeInTheDocument(),
+    );
+    await user.click(screen.getByText('https://api.example.com/cperr'));
+
+    await user.click(await screen.findByTestId('codegen-copy'));
+
+    expect(await screen.findByText(/Copy failed/i)).toBeInTheDocument();
+  });
+
+  it('formats a request body via the request-body-format button', async () => {
+    const user = userEvent.setup();
+    const row = makeConn({
+    method: 'POST',
+    request_body: '{"a":1,"b":2}',
+    request_headers: [['Content-Type', 'application/json']] as [string, string][],
+    content_type: 'application/json',
+    response_body: null,
+    });
+    invokeMock.mockImplementation(async (cmd: string) => {
+    if (cmd === 'get_connections') return [row];
+    return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() =>
+    expect(screen.getByText('https://api.example.com/foo')).toBeInTheDocument(),
+    );
+    await user.click(screen.getByText('https://api.example.com/foo'));
+
+    await user.click(await screen.findByTestId('request-body-format'));
+
+    expect(await screen.findByText(/Body formatted/i)).toBeInTheDocument();
+  });
+
+  it('saves a request body via the request-body-save button', async () => {
+    const user = userEvent.setup();
+    Object.assign(URL, {
+    createObjectURL: vi.fn(() => 'blob:fake-req'),
+    revokeObjectURL: vi.fn(),
+    });
+    const row = makeConn({
+    method: 'POST',
+    request_body: '{"x":1}',
+    request_headers: [['Content-Type', 'application/json']] as [string, string][],
+    response_body: null,
+    });
+    invokeMock.mockImplementation(async (cmd: string) => {
+    if (cmd === 'get_connections') return [row];
+    return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() =>
+    expect(screen.getByText('https://api.example.com/foo')).toBeInTheDocument(),
+    );
+    await user.click(screen.getByText('https://api.example.com/foo'));
+
+    await user.click(await screen.findByTestId('request-body-save'));
+
+    expect(await screen.findByText(/Saving /i)).toBeInTheDocument();
+  });
+
+  it('saves a binary response body via the data URI download path', async () => {
+    const user = userEvent.setup();
+    const createObjectURL = vi.fn(() => 'blob:fake-bin');
+    Object.assign(URL, {
+    createObjectURL,
+    revokeObjectURL: vi.fn(),
+    });
+    const row = makeConn({
+    content_type: 'application/octet-stream',
+    response_headers: [['Content-Type', 'application/octet-stream']] as [string, string][],
+    response_body: 'data:application/octet-stream;base64,QUJDRA==',
+    });
+    invokeMock.mockImplementation(async (cmd: string) => {
+    if (cmd === 'get_connections') return [row];
+    return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() =>
+    expect(screen.getByText('https://api.example.com/foo')).toBeInTheDocument(),
+    );
+    await user.click(screen.getByText('https://api.example.com/foo'));
+
+    await user.click(await screen.findByTestId('response-body-save'));
+
+    expect(await screen.findByText(/Saving /i)).toBeInTheDocument();
+  });
+});

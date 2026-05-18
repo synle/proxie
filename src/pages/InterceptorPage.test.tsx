@@ -573,4 +573,182 @@ describe('InterceptorPage', () => {
       );
     });
   });
+
+  it('changing Content-Type in the mock action is reflected in the saved payload', async () => {
+    const user = userEvent.setup();
+    let captured: Record<string, unknown> | null = null;
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === 'get_intercept_rules') return [];
+      if (cmd === 'add_intercept_rule') {
+        captured = args?.rule as Record<string, unknown>;
+        return [captured];
+      }
+      return undefined;
+    });
+
+    render(<InterceptorPage />);
+    await waitFor(() =>
+      expect(screen.getByText(/No intercept rules/i)).toBeInTheDocument(),
+    );
+
+    await user.click(screen.getByRole('button', { name: /Add Rule/i }));
+    const dialog = screen.getByRole('dialog');
+
+    await user.type(within(dialog).getByLabelText(/Rule Name/i), 'ct test');
+    await user.type(within(dialog).getByLabelText(/^Host$/), 'api.example.com');
+    await user.type(within(dialog).getByLabelText(/^Path$/), '/x');
+
+    const ct = within(dialog).getByLabelText(/Content-Type/i);
+    await user.clear(ct);
+    await user.type(ct, 'text/plain');
+
+    await user.click(within(dialog).getByRole('button', { name: 'Add' }));
+
+    await waitFor(() => {
+      expect(captured).not.toBeNull();
+    });
+    const action = (captured as { action: { response: { headers: { name: string; value: string }[] } } }).action;
+    const ctHeader = action.response.headers.find((h) => h.name === 'Content-Type');
+    expect(ctHeader?.value).toBe('text/plain');
+  });
+
+  it('Cancel button closes the dialog without invoking add/update', async () => {
+    const user = userEvent.setup();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_intercept_rules') return [];
+      return undefined;
+    });
+
+    render(<InterceptorPage />);
+    await waitFor(() =>
+      expect(screen.getByText(/No intercept rules/i)).toBeInTheDocument(),
+    );
+
+    await user.click(screen.getByRole('button', { name: /Add Rule/i }));
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+
+    await user.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: /Cancel/i }),
+    );
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(invokeMock.mock.calls.some((c) => c[0] === 'add_intercept_rule')).toBe(false);
+    expect(invokeMock.mock.calls.some((c) => c[0] === 'update_intercept_rule')).toBe(false);
+  });
+
+  it('HAR import error alert can be dismissed via its close button', async () => {
+    const user = userEvent.setup();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_intercept_rules') return [];
+      return undefined;
+    });
+
+    render(<InterceptorPage />);
+    await waitFor(() =>
+      expect(screen.getByText(/No intercept rules/i)).toBeInTheDocument(),
+    );
+
+    await user.click(screen.getByRole('button', { name: /Add Rule/i }));
+    const dialog = screen.getByRole('dialog');
+
+    // Trigger an import error via clearly-invalid JSON.
+    const body = within(dialog).getByLabelText(/Response Body/i);
+    await user.type(body, 'not-json-at-all');
+    await user.click(within(dialog).getByRole('button', { name: /Import from HAR Response/i }));
+
+    const alert = await within(dialog).findByRole('alert');
+    expect(alert).toBeInTheDocument();
+
+    // The Alert's close button has aria-label "Close".
+    await user.click(within(alert).getByRole('button', { name: /^Close$/i }));
+
+    await waitFor(() => {
+      expect(within(dialog).queryByRole('alert')).toBeNull();
+    });
+  });
+
+  it('logs an error when add_intercept_rule rejects (save error path)', async () => {
+    const user = userEvent.setup();
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_intercept_rules') return [];
+      if (cmd === 'add_intercept_rule') throw new Error('save boom');
+      return undefined;
+    });
+
+    render(<InterceptorPage />);
+    await waitFor(() =>
+      expect(screen.getByText(/No intercept rules/i)).toBeInTheDocument(),
+    );
+
+    await user.click(screen.getByRole('button', { name: /Add Rule/i }));
+    const dialog = screen.getByRole('dialog');
+    await user.type(within(dialog).getByLabelText(/Rule Name/i), 'fail-save');
+    await user.type(within(dialog).getByLabelText(/^Host$/), 'fail.example.com');
+    await user.type(within(dialog).getByLabelText(/^Path$/), '/x');
+    await user.click(within(dialog).getByRole('button', { name: 'Add' }));
+
+    await waitFor(() => {
+      expect(err).toHaveBeenCalledWith('Failed to save rule:', expect.any(Error));
+    });
+    // Dialog stays open on failure.
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    err.mockRestore();
+  });
+
+  it('Method "Any" submits match_method=null', async () => {
+    const user = userEvent.setup();
+    let captured: Record<string, unknown> | null = null;
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === 'get_intercept_rules') return [];
+      if (cmd === 'add_intercept_rule') {
+        captured = args?.rule as Record<string, unknown>;
+        return [captured];
+      }
+      return undefined;
+    });
+
+    render(<InterceptorPage />);
+    await waitFor(() =>
+      expect(screen.getByText(/No intercept rules/i)).toBeInTheDocument(),
+    );
+
+    await user.click(screen.getByRole('button', { name: /Add Rule/i }));
+    const dialog = screen.getByRole('dialog');
+
+    await user.type(within(dialog).getByLabelText(/Rule Name/i), 'any-method');
+    await user.type(within(dialog).getByLabelText(/^Host$/), 'any.example.com');
+    await user.type(within(dialog).getByLabelText(/^Path$/), '/any');
+    // Default method is null/'Any' — saving without picking should produce null.
+
+    await user.click(within(dialog).getByRole('button', { name: 'Add' }));
+
+    await waitFor(() => {
+      expect(captured).not.toBeNull();
+    });
+    expect(captured).toMatchObject({ match_method: null });
+  });
+
+  it('pressing Escape closes the dialog (Dialog onClose path)', async () => {
+    const user = userEvent.setup();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_intercept_rules') return [];
+      return undefined;
+    });
+
+    render(<InterceptorPage />);
+    await waitFor(() =>
+      expect(screen.getByText(/No intercept rules/i)).toBeInTheDocument(),
+    );
+
+    await user.click(screen.getByRole('button', { name: /Add Rule/i }));
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+
+    await user.keyboard('{Escape}');
+
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).toBeNull();
+    });
+  });
+
 });
