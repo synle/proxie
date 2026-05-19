@@ -160,7 +160,7 @@ describe('BlockRulesPage', () => {
     render(<BlockRulesPage />);
     await waitFor(() => expect(screen.getByText('*.doubleclick.net')).toBeInTheDocument());
 
-    await user.click(screen.getByLabelText('toggle *.doubleclick.net'));
+    await user.click(screen.getByRole('checkbox', { name: 'toggle *.doubleclick.net' }));
 
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith(

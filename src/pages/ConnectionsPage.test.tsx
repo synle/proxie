@@ -424,3 +424,94 @@ describe('ConnectionsPage — column filters', () => {
     });
   });
 });
+
+describe('ConnectionsPage — auto-reload on focus / visibility', () => {
+  const invokeMock = invoke as unknown as ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return [];
+      return undefined;
+    });
+    // Default to visible at the start of each test.
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true,
+      get: () => 'visible',
+    });
+  });
+
+  /**
+   * Count invokes of `get_connections` on the shared mock.
+   *
+   * @returns Number of calls to `invoke('get_connections', ...)`.
+   */
+  function getConnCallCount(): number {
+    return invokeMock.mock.calls.filter((c) => c[0] === 'get_connections').length;
+  }
+
+  it('reloads connections when the window receives focus', async () => {
+    render(<ConnectionsPage />);
+    await waitFor(() => {
+      expect(getConnCallCount()).toBeGreaterThanOrEqual(1);
+    });
+    const before = getConnCallCount();
+
+    window.dispatchEvent(new Event('focus'));
+
+    await waitFor(() => {
+      expect(getConnCallCount()).toBeGreaterThan(before);
+    });
+  });
+
+  it('reloads connections when document becomes visible', async () => {
+    render(<ConnectionsPage />);
+    await waitFor(() => {
+      expect(getConnCallCount()).toBeGreaterThanOrEqual(1);
+    });
+    const before = getConnCallCount();
+
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true,
+      get: () => 'visible',
+    });
+    document.dispatchEvent(new Event('visibilitychange'));
+
+    await waitFor(() => {
+      expect(getConnCallCount()).toBeGreaterThan(before);
+    });
+  });
+
+  it('does NOT reload when visibilitychange fires while hidden', async () => {
+    render(<ConnectionsPage />);
+    await waitFor(() => {
+      expect(getConnCallCount()).toBeGreaterThanOrEqual(1);
+    });
+    const before = getConnCallCount();
+
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true,
+      get: () => 'hidden',
+    });
+    document.dispatchEvent(new Event('visibilitychange'));
+
+    // Give any erroneous fetch a tick to fire.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(getConnCallCount()).toBe(before);
+  });
+
+  it('removes focus / visibilitychange listeners on unmount', async () => {
+    const { unmount } = render(<ConnectionsPage />);
+    await waitFor(() => {
+      expect(getConnCallCount()).toBeGreaterThanOrEqual(1);
+    });
+
+    unmount();
+    const before = getConnCallCount();
+    window.dispatchEvent(new Event('focus'));
+    document.dispatchEvent(new Event('visibilitychange'));
+
+    await new Promise((r) => setTimeout(r, 50));
+    expect(getConnCallCount()).toBe(before);
+  });
+});
