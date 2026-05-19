@@ -35,6 +35,12 @@ import ExpandLessIcon from '@mui/icons-material/ExpandLess';
 import SearchIcon from '@mui/icons-material/Search';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import UrlFilterDialog, {
+  DEFAULT_URL_FILTERS,
+  activeClauseCount,
+  matchesUrlFilters,
+  type UrlFilters,
+} from '../components/UrlFilterDialog';
 import {
   ColumnsButton,
   loadVisibleColumns,
@@ -407,7 +413,7 @@ type Op = '>=' | '<=';
 interface ColumnFilters {
   methods: string[];
   statusBuckets: string[];
-  urlContains: string;
+  url: UrlFilters;
   durationOp: Op;
   durationValue: string;
   sizeOp: Op;
@@ -418,7 +424,7 @@ interface ColumnFilters {
 const DEFAULT_FILTERS: ColumnFilters = {
   methods: [],
   statusBuckets: [],
-  urlContains: '',
+  url: DEFAULT_URL_FILTERS,
   durationOp: '>=',
   durationValue: '',
   sizeOp: '>=',
@@ -435,9 +441,7 @@ function matchesColumnFilters(c: ConnectionLog, f: ColumnFilters, now: number): 
     );
     if (!inBucket) return false;
   }
-  if (f.urlContains.trim()) {
-    if (!c.url.toLowerCase().includes(f.urlContains.toLowerCase().trim())) return false;
-  }
+  if (!matchesUrlFilters(c.url, f.url)) return false;
   if (f.durationValue.trim()) {
     const v = Number(f.durationValue);
     if (Number.isFinite(v)) {
@@ -867,10 +871,12 @@ function FilterRow({
       ...filters,
       statusBuckets: typeof e.target.value === 'string' ? [] : e.target.value,
     });
+  const urlActiveCount = activeClauseCount(filters.url);
+  const [urlDialogOpen, setUrlDialogOpen] = useState(false);
   const hasAnyFilter =
     filters.methods.length +
       filters.statusBuckets.length +
-      (filters.urlContains.trim() ? 1 : 0) +
+      urlActiveCount +
       (filters.durationValue.trim() ? 1 : 0) +
       (filters.sizeValue.trim() ? 1 : 0) +
       (filters.timeWindowMs != null ? 1 : 0) >
@@ -900,14 +906,24 @@ function FilterRow({
       )}
       {isVisible('url') && (
         <TableCell>
-          <TextField
-            data-testid='url-filter'
-            placeholder='contains...'
-            value={filters.urlContains}
-            onChange={(e) => setFilters({ ...filters, urlContains: e.target.value })}
+          <Button
+            data-testid='url-filter-button'
             size='small'
-            fullWidth
-            slotProps={{ htmlInput: { style: { fontSize: '0.75rem', padding: 6 } } }}
+            variant='outlined'
+            onClick={() => setUrlDialogOpen(true)}
+            sx={{ fontSize: '0.7rem', textTransform: 'none', py: 0.25 }}>
+            {urlActiveCount > 0
+              ? `URL · ${urlActiveCount} filter${urlActiveCount === 1 ? '' : 's'}`
+              : 'URL — any'}
+          </Button>
+          <UrlFilterDialog
+            open={urlDialogOpen}
+            value={filters.url}
+            onClose={() => setUrlDialogOpen(false)}
+            onSave={(next) => {
+              setFilters({ ...filters, url: next });
+              setUrlDialogOpen(false);
+            }}
           />
           {hasAnyFilter && (
             <Button
