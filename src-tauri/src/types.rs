@@ -165,6 +165,77 @@ impl Default for HarResponse {
     }
 }
 
+/// Top-level configuration export envelope. Bundles user-managed rule sets
+/// (host / intercept / block) plus provenance metadata so an export can be
+/// reviewed, shared, or stored offline before being re-imported on the same
+/// or another machine.
+///
+/// # Fields
+/// * `version` - Proxie version (from `CARGO_PKG_VERSION`) that produced the export.
+/// * `exported_at` - ISO-8601 UTC timestamp of the export.
+/// * `host_rules` - Snapshot of host-tracking rules.
+/// * `intercept_rules` - Snapshot of mock/reroute intercept rules.
+/// * `block_rules` - Snapshot of Pi-hole style block rules.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigExport {
+    pub version: String,
+    pub exported_at: String,
+    #[serde(default)]
+    pub host_rules: Vec<HostRule>,
+    #[serde(default)]
+    pub intercept_rules: Vec<InterceptRule>,
+    #[serde(default)]
+    pub block_rules: Vec<BlockRule>,
+}
+
+/// Summary returned to the frontend after a successful `import_config` call.
+/// Counts only newly-applied rules — in `merge` mode, rules whose `id` already
+/// exists are skipped and NOT counted.
+///
+/// # Fields
+/// * `host_rules_added` - Number of host rules persisted by the import.
+/// * `intercept_rules_added` - Number of intercept rules persisted.
+/// * `block_rules_added` - Number of block rules persisted.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ImportSummary {
+    pub host_rules_added: u32,
+    pub intercept_rules_added: u32,
+    pub block_rules_added: u32,
+}
+
+/// Import mode controlling how an incoming [`ConfigExport`] is folded into the
+/// current persisted state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportMode {
+    /// Wipe the matching rule lists entirely and replace with the import.
+    Replace,
+    /// Append imported rules, skipping any whose `id` already exists.
+    Merge,
+}
+
+impl ImportMode {
+    /// Parse a frontend-supplied mode string (`"replace"` or `"merge"`).
+    /// Case-insensitive. Returns an `Err(String)` for any other value so the
+    /// command rejects unknown modes rather than silently defaulting (rule
+    /// 21 — allowlist inputs).
+    ///
+    /// # Arguments
+    /// * `s` - Mode string from the Tauri invoke arg.
+    ///
+    /// # Returns
+    /// `Ok(ImportMode)` on a recognized value, `Err(String)` otherwise.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "replace" => Ok(Self::Replace),
+            "merge" => Ok(Self::Merge),
+            other => Err(format!(
+                "invalid import mode '{}': expected 'replace' or 'merge'",
+                other
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyStatus {
     pub running: bool,
@@ -403,6 +474,58 @@ mod tests {
         assert_eq!(resp.status_text, "OK");
         assert_eq!(resp.headers.len(), 1);
         assert_eq!(resp.content.mime_type, "application/json");
+    }
+
+    #[test]
+    fn test_import_mode_parse_valid() {
+        assert_eq!(ImportMode::parse("replace").unwrap(), ImportMode::Replace);
+        assert_eq!(ImportMode::parse("merge").unwrap(), ImportMode::Merge);
+        // Case-insensitive
+        assert_eq!(ImportMode::parse("Replace").unwrap(), ImportMode::Replace);
+        assert_eq!(ImportMode::parse("MERGE").unwrap(), ImportMode::Merge);
+    }
+
+    #[test]
+    fn test_import_mode_parse_invalid() {
+        let err = ImportMode::parse("overwrite").unwrap_err();
+        assert!(err.contains("invalid import mode"));
+        assert!(err.contains("overwrite"));
+        assert!(ImportMode::parse("").is_err());
+    }
+
+    #[test]
+    fn test_config_export_serde_roundtrip() {
+        let exp = ConfigExport {
+            version: "0.4.3".to_string(),
+            exported_at: "2026-05-18T00:00:00Z".to_string(),
+            host_rules: vec![HostRule {
+                id: "h1".to_string(),
+                host: "api.example.com".to_string(),
+                enabled: true,
+                ignore_paths: vec![],
+            }],
+            intercept_rules: vec![],
+            block_rules: vec![BlockRule {
+                id: "b1".to_string(),
+                host_pattern: "*.ads.com".to_string(),
+                path_pattern: None,
+                enabled: true,
+                note: "ads".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&exp).unwrap();
+        let back: ConfigExport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.version, "0.4.3");
+        assert_eq!(back.host_rules.len(), 1);
+        assert_eq!(back.block_rules.len(), 1);
+    }
+
+    #[test]
+    fn test_import_summary_default_zero() {
+        let s = ImportSummary::default();
+        assert_eq!(s.host_rules_added, 0);
+        assert_eq!(s.intercept_rules_added, 0);
+        assert_eq!(s.block_rules_added, 0);
     }
 
     #[test]

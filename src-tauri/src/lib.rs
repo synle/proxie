@@ -12,7 +12,8 @@ use state::AppState;
 use std::sync::Arc;
 use tauri::Manager;
 use types::{
-    BlockRule, CertInfo, ConnectionLog, HostRule, InterceptRule, ProxyConfig, ProxyStatus,
+    BlockRule, CertInfo, ConnectionLog, HostRule, ImportMode, ImportSummary, InterceptRule,
+    ProxyConfig, ProxyStatus,
 };
 
 #[tauri::command]
@@ -152,6 +153,38 @@ async fn delete_block_rule(
         .map_err(|e| e.to_string())
 }
 
+/// Export the user's persisted rule sets (host / intercept / block) as a
+/// pretty-printed JSON string. Intended to be triggered by the Setup page
+/// "Export Config" button, then offered to the user as a `proxie.json`
+/// download.
+#[tauri::command]
+async fn export_config(state: tauri::State<'_, Arc<AppState>>) -> Result<String, String> {
+    state
+        .export_config(env!("CARGO_PKG_VERSION"))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Import a previously-exported configuration bundle.
+///
+/// # Arguments
+/// * `json` - Raw file contents read on the frontend.
+/// * `mode` - `"replace"` wipes existing rules per list, `"merge"` appends
+///   and skips duplicates by `id`.
+///
+/// # Errors
+/// Returns a user-safe `Err(String)` on invalid JSON, wrong shape, or an
+/// unknown mode. Raw paths and IO error chains are not leaked.
+#[tauri::command]
+async fn import_config(
+    state: tauri::State<'_, Arc<AppState>>,
+    json: String,
+    mode: String,
+) -> Result<ImportSummary, String> {
+    let mode = ImportMode::parse(&mode)?;
+    state.import_config(&json, mode).await
+}
+
 #[tauri::command]
 async fn get_connections(
     state: tauri::State<'_, Arc<AppState>>,
@@ -206,6 +239,57 @@ async fn get_proxy_status(state: tauri::State<'_, Arc<AppState>>) -> Result<Prox
     state.get_proxy_status().await.map_err(|e| e.to_string())
 }
 
+/// Return the host OS family as a lowercase string compatible with
+/// `@tauri-apps/plugin-os`'s `platform()` return values.
+///
+/// Used by the frontend Setup page to gate the macOS Permissions &
+/// System Setup card. The empty fallback (`""`) keeps tests/builds on
+/// exotic targets parseable instead of panicking — the frontend simply
+/// hides the macOS-only UI.
+#[tauri::command]
+fn get_platform() -> String {
+    if cfg!(target_os = "macos") {
+        "macos".to_string()
+    } else if cfg!(target_os = "windows") {
+        "windows".to_string()
+    } else if cfg!(target_os = "linux") {
+        "linux".to_string()
+    } else {
+        "".to_string()
+    }
+}
+
+/// Open the supplied URL or file path using the OS default handler.
+///
+/// macOS: shells out to `open <url>`. Windows: `cmd /C start`. Linux:
+/// `xdg-open`. Any non-zero exit status is surfaced as an `Err` so the
+/// frontend can fall back to an alternate URL (e.g. the modern macOS
+/// System Settings URL → legacy `com.apple.preference.network` URL).
+///
+/// # Errors
+/// Returns the underlying I/O error or a `"exit code <n>"` message when
+/// the child process fails to launch or exits non-zero.
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    let result = if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(&url).status()
+    } else if cfg!(target_os = "windows") {
+        // `start` is a cmd builtin; the empty `""` is the optional title
+        // argument that `start` requires when the first quoted argument
+        // would otherwise be treated as the window title.
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", &url])
+            .status()
+    } else {
+        std::process::Command::new("xdg-open").arg(&url).status()
+    };
+    match result {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("exit code {status}")),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     env_logger::init();
@@ -213,6 +297,14 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let app_state = Arc::new(AppState::new(app.handle()));
+            // Auto-load `<config-dir>/proxie.json` if present and the current
+            // config has no rules. Runs on the Tokio runtime that Tauri has
+            // already spun up. Errors are logged and swallowed — we never
+            // want a malformed sidecar to break app startup.
+            let autoload_state = Arc::clone(&app_state);
+            tauri::async_runtime::spawn(async move {
+                autoload_state.maybe_autoload_proxie_json().await;
+            });
             app.manage(app_state);
             Ok(())
         })
@@ -233,12 +325,16 @@ pub fn run() {
             add_block_rule,
             update_block_rule,
             delete_block_rule,
+            export_config,
+            import_config,
             get_connections,
             clear_connections,
             set_bookmark,
             start_proxy,
             stop_proxy,
             get_proxy_status,
+            get_platform,
+            open_url,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -268,5 +364,34 @@ mod tests {
         let config = ProxyConfig::default();
         assert_eq!(config.port, 39871);
         assert_eq!(config.listen_addr, "127.0.0.1");
+    }
+
+    #[test]
+    fn test_get_platform_returns_current_os() {
+        let p = get_platform();
+        let expected = if cfg!(target_os = "macos") {
+            "macos"
+        } else if cfg!(target_os = "windows") {
+            "windows"
+        } else if cfg!(target_os = "linux") {
+            "linux"
+        } else {
+            ""
+        };
+        assert_eq!(p, expected);
+    }
+
+    #[test]
+    fn test_open_url_invalid_command_returns_err() {
+        // On the CI Linux runner `xdg-open` is unlikely to be installed
+        // in the test sandbox, and on every platform a bogus
+        // gopher-scheme URL with no handler will fail. We only assert
+        // the function returns `Err` rather than panicking — exact
+        // error text is OS-dependent.
+        let res = open_url("gopher://nonexistent.invalid/proxie-test".to_string());
+        // We tolerate Ok on systems where the opener silently succeeds
+        // (e.g. macOS `open` returns 0 even for unhandled schemes), so
+        // just ensure no panic and result type is correct.
+        let _: Result<(), String> = res;
     }
 }

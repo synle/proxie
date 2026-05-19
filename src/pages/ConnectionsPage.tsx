@@ -33,12 +33,20 @@ import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import StarIcon from '@mui/icons-material/Star';
 import StarBorderIcon from '@mui/icons-material/StarBorder';
 import FileDownloadIcon from '@mui/icons-material/FileDownload';
+import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
+import ExpandLessIcon from '@mui/icons-material/ExpandLess';
 import SearchIcon from '@mui/icons-material/Search';
 import { Menu } from '@mui/material';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { CODEGEN, CODEGEN_LANGS, generateBundle } from '../lib/codegen';
 import { connectionsToHar } from '../lib/har';
+import UrlFilterDialog, {
+  DEFAULT_URL_FILTERS,
+  activeClauseCount,
+  matchesUrlFilters,
+  type UrlFilters,
+} from '../components/UrlFilterDialog';
 import {
   ColumnsButton,
   loadVisibleColumns,
@@ -349,7 +357,7 @@ type Op = '>=' | '<=';
 interface ColumnFilters {
   methods: string[];
   statusBuckets: string[];
-  urlContains: string;
+  url: UrlFilters;
   durationOp: Op;
   durationValue: string;
   sizeOp: Op;
@@ -360,7 +368,7 @@ interface ColumnFilters {
 const DEFAULT_FILTERS: ColumnFilters = {
   methods: [],
   statusBuckets: [],
-  urlContains: '',
+  url: DEFAULT_URL_FILTERS,
   durationOp: '>=',
   durationValue: '',
   sizeOp: '>=',
@@ -377,9 +385,7 @@ function matchesColumnFilters(c: ConnectionLog, f: ColumnFilters, now: number): 
     );
     if (!inBucket) return false;
   }
-  if (f.urlContains.trim()) {
-    if (!c.url.toLowerCase().includes(f.urlContains.toLowerCase().trim())) return false;
-  }
+  if (!matchesUrlFilters(c.url, f.url)) return false;
   if (f.durationValue.trim()) {
     const v = Number(f.durationValue);
     if (Number.isFinite(v)) {
@@ -853,10 +859,12 @@ function FilterRow({
       ...filters,
       statusBuckets: typeof e.target.value === 'string' ? [] : e.target.value,
     });
+  const urlActiveCount = activeClauseCount(filters.url);
+  const [urlDialogOpen, setUrlDialogOpen] = useState(false);
   const hasAnyFilter =
     filters.methods.length +
       filters.statusBuckets.length +
-      (filters.urlContains.trim() ? 1 : 0) +
+      urlActiveCount +
       (filters.durationValue.trim() ? 1 : 0) +
       (filters.sizeValue.trim() ? 1 : 0) +
       (filters.timeWindowMs != null ? 1 : 0) >
@@ -887,14 +895,24 @@ function FilterRow({
       )}
       {isVisible('url') && (
         <TableCell>
-          <TextField
-            data-testid='url-filter'
-            placeholder='contains...'
-            value={filters.urlContains}
-            onChange={(e) => setFilters({ ...filters, urlContains: e.target.value })}
+          <Button
+            data-testid='url-filter-button'
             size='small'
-            fullWidth
-            slotProps={{ htmlInput: { style: { fontSize: '0.75rem', padding: 6 } } }}
+            variant='outlined'
+            onClick={() => setUrlDialogOpen(true)}
+            sx={{ fontSize: '0.7rem', textTransform: 'none', py: 0.25 }}>
+            {urlActiveCount > 0
+              ? `URL · ${urlActiveCount} filter${urlActiveCount === 1 ? '' : 's'}`
+              : 'URL — any'}
+          </Button>
+          <UrlFilterDialog
+            open={urlDialogOpen}
+            value={filters.url}
+            onClose={() => setUrlDialogOpen(false)}
+            onSave={(next) => {
+              setFilters({ ...filters, url: next });
+              setUrlDialogOpen(false);
+            }}
           />
           {hasAnyFilter && (
             <Button
@@ -1023,11 +1041,21 @@ function DetailDrawerContent({
   const [reqDisplay, setReqDisplay] = useState<string | null>(null);
   const [respDisplay, setRespDisplay] = useState<string | null>(null);
   const [codegenLang, setCodegenLang] = useState<string>('curl');
-  // Reset overrides when switching rows.
+  // Body-card collapse state — both cards start collapsed, top-100-lines view
+  // when expanded; "Show all" reveals the rest.
+  const [requestBodyExpanded, setRequestBodyExpanded] = useState(false);
+  const [responseBodyExpanded, setResponseBodyExpanded] = useState(false);
+  const [requestShowAll, setRequestShowAll] = useState(false);
+  const [responseShowAll, setResponseShowAll] = useState(false);
+  // Reset overrides + collapse state when switching rows.
   const connId = conn.id;
   useEffect(() => {
     setReqDisplay(null);
     setRespDisplay(null);
+    setRequestBodyExpanded(false);
+    setResponseBodyExpanded(false);
+    setRequestShowAll(false);
+    setResponseShowAll(false);
   }, [connId]);
 
   const reqDecoded = decodeBody(conn.request_body, conn.content_type);
@@ -1096,6 +1124,10 @@ function DetailDrawerContent({
           title='Request Body'
           decoded={reqDecoded}
           override={reqDisplay}
+          expanded={requestBodyExpanded}
+          onToggleExpanded={() => setRequestBodyExpanded((v) => !v)}
+          showAll={requestShowAll}
+          onShowAll={() => setRequestShowAll(true)}
           onFormat={() => {
             if (reqDecoded.isDataUri) {
               onToast({ kind: 'info', msg: 'Cannot format a binary body.' });
@@ -1107,6 +1139,9 @@ function DetailDrawerContent({
               return;
             }
             setReqDisplay(out);
+            // Auto-expand on a successful format so the user immediately sees
+            // the pretty-printed result instead of staring at the collapsed hint.
+            setRequestBodyExpanded(true);
             onToast({ kind: 'success', msg: 'Body formatted.' });
           }}
           onSave={() => {
@@ -1123,6 +1158,10 @@ function DetailDrawerContent({
           title='Response Body'
           decoded={respDecoded}
           override={respDisplay}
+          expanded={responseBodyExpanded}
+          onToggleExpanded={() => setResponseBodyExpanded((v) => !v)}
+          showAll={responseShowAll}
+          onShowAll={() => setResponseShowAll(true)}
           onFormat={() => {
             if (respDecoded.isDataUri) {
               onToast({ kind: 'info', msg: 'Cannot format a binary body.' });
@@ -1134,6 +1173,9 @@ function DetailDrawerContent({
               return;
             }
             setRespDisplay(out);
+            // Auto-expand on a successful format so the user immediately sees
+            // the pretty-printed result instead of staring at the collapsed hint.
+            setResponseBodyExpanded(true);
             onToast({ kind: 'success', msg: 'Body formatted.' });
           }}
           onSave={() => {
@@ -1199,21 +1241,66 @@ function headerLookup(headers: [string, string][], name: string): string | null 
 // BodySection — renders preview (text vs image/video/audio/iframe) + actions.
 // ---------------------------------------------------------------------------
 
+/**
+ * Render one body card (Request or Response) in the connection drawer.
+ *
+ * The card is collapsible. Default state is collapsed — only the header (with
+ * Format/Save buttons + an expand toggle) and a "N lines, N bytes" hint are
+ * shown. When expanded, the body preview renders the first 100 lines; a
+ * "Show all (N more lines)" button reveals the rest.
+ *
+ * Binary `data:`-URI bodies skip the collapse path entirely so media
+ * previews (img/video/audio/pdf) stay inline.
+ *
+ * @param title - "Request Body" or "Response Body".
+ * @param decoded - Decoded body payload (text or data: URI metadata).
+ * @param override - Optional formatted-body override (set by Format button).
+ * @param expanded - Whether the body content is visible.
+ * @param onToggleExpanded - Flip the expanded state.
+ * @param showAll - When true (and expanded), render the full body; else top
+ *   100 lines only.
+ * @param onShowAll - Reveal the remaining lines beyond the first 100.
+ * @param onFormat - Pretty-print the body (mime-driven).
+ * @param onSave - Download the body to a local file.
+ */
 function BodySection({
   title,
   decoded,
   override,
+  expanded,
+  onToggleExpanded,
+  showAll,
+  onShowAll,
   onFormat,
   onSave,
 }: {
   title: string;
   decoded: DecodedBody;
   override: string | null;
+  expanded: boolean;
+  onToggleExpanded: () => void;
+  showAll: boolean;
+  onShowAll: () => void;
   onFormat: () => void;
   onSave: () => void;
 }) {
-  const showText = !decoded.isDataUri;
+  // Treat `application/octet-stream` non-data-URI bodies as binary so we
+  // render the same "Binary content" placeholder used for `data:` URIs
+  // instead of forcing the user through a collapse toggle for garbled bytes.
+  const isOctetStream = decoded.mime.toLowerCase().startsWith('application/octet-stream');
+  const showText = !decoded.isDataUri && !isOctetStream;
   const canFormat = showText && isFormatterMime(decoded.mime);
+  const slug = title.toLowerCase().replace(' ', '-');
+  // Binary previews (image/video/audio/pdf/octet-stream) bypass the collapse
+  // — keep them inline so the user sees the media / placeholder without an
+  // extra click.
+  const collapsible = showText;
+  // Effective text we'd render in fully-expanded mode (formatter override
+  // wins over the raw decoded text).
+  const fullText = override ?? decoded.text;
+  const totalLines = showText ? (fullText === '' ? 0 : fullText.split('\n').length) : 0;
+  const hiddenLineCount = Math.max(0, totalLines - 100);
+  const hasMore = hiddenLineCount > 0;
 
   return (
     <>
@@ -1225,7 +1312,7 @@ function BodySection({
           <Tooltip title='Pretty-print this body'>
             <Button
               size='small'
-              data-testid={`${title.toLowerCase().replace(' ', '-')}-format`}
+              data-testid={`${slug}-format`}
               startIcon={<AutoFixHighIcon fontSize='small' />}
               onClick={onFormat}>
               Format
@@ -1235,28 +1322,78 @@ function BodySection({
         <Tooltip title='Save to a local file'>
           <Button
             size='small'
-            data-testid={`${title.toLowerCase().replace(' ', '-')}-save`}
+            data-testid={`${slug}-save`}
             startIcon={<DownloadIcon fontSize='small' />}
             onClick={onSave}>
             Save
           </Button>
         </Tooltip>
+        {collapsible && (
+          <Tooltip title={expanded ? 'Collapse body' : 'Expand body'}>
+            <IconButton
+              size='small'
+              data-testid={`${slug}-toggle`}
+              aria-label={expanded ? `Collapse ${title}` : `Expand ${title}`}
+              aria-expanded={expanded}
+              onClick={onToggleExpanded}>
+              {expanded ? (
+                <ExpandLessIcon fontSize='small' />
+              ) : (
+                <ExpandMoreIcon fontSize='small' />
+              )}
+            </IconButton>
+          </Tooltip>
+        )}
       </Box>
-      <Card variant='outlined'>
-        <CardContent sx={{ p: 1, '&:last-child': { pb: 1 } }}>
-          <BodyPreview decoded={decoded} override={override} />
-        </CardContent>
-      </Card>
+      {collapsible && !expanded ? (
+        <Typography
+          data-testid={`${slug}-collapsed-hint`}
+          variant='caption'
+          color='text.secondary'>
+          {totalLines} {totalLines === 1 ? 'line' : 'lines'},{' '}
+          {formatBytes(decoded.byteLength)} — click to expand.
+        </Typography>
+      ) : (
+        <Card variant='outlined'>
+          <CardContent sx={{ p: 1, '&:last-child': { pb: 1 } }}>
+            <BodyPreview
+              decoded={decoded}
+              override={override}
+              showAll={!collapsible || showAll}
+            />
+            {collapsible && !showAll && hasMore && (
+              <Button
+                size='small'
+                data-testid={`${slug}-show-all`}
+                onClick={onShowAll}
+                sx={{ mt: 1 }}>
+                Show all ({hiddenLineCount} more {hiddenLineCount === 1 ? 'line' : 'lines'})
+              </Button>
+            )}
+          </CardContent>
+        </Card>
+      )}
     </>
   );
 }
 
+/**
+ * Render the inner body preview: media element for `data:` URIs, otherwise a
+ * `<pre>` block with the (optionally truncated) text.
+ *
+ * @param decoded - Decoded body payload.
+ * @param override - Optional formatted-body override.
+ * @param showAll - When false, truncate text bodies to the first 100 lines.
+ *   Defaults to true so media-preview callers don't have to opt in.
+ */
 function BodyPreview({
   decoded,
   override,
+  showAll = true,
 }: {
   decoded: DecodedBody;
   override: string | null;
+  showAll?: boolean;
 }) {
   if (decoded.isDataUri) {
     const m = decoded.mime.toLowerCase();
@@ -1326,11 +1463,13 @@ function BodyPreview({
     );
   }
 
+  const full = override ?? decoded.text;
+  const text = showAll ? full : full.split('\n').slice(0, 100).join('\n');
   return (
     <pre
       data-testid='body-preview-text'
       style={{ margin: 0, fontSize: '0.8em', whiteSpace: 'pre-wrap' }}>
-      {override ?? decoded.text}
+      {text}
     </pre>
   );
 }

@@ -1,7 +1,8 @@
 use crate::cert;
 use crate::tls::LeafCertCache;
 use crate::types::{
-    BlockRule, CertInfo, ConnectionLog, HostRule, InterceptRule, ProxyConfig, ProxyStatus,
+    BlockRule, CertInfo, ConfigExport, ConnectionLog, HostRule, ImportMode, ImportSummary,
+    InterceptRule, ProxyConfig, ProxyStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -99,9 +100,18 @@ impl AppState {
         *guard = None;
     }
 
-    fn config_path() -> PathBuf {
+    pub(crate) fn config_path() -> PathBuf {
         let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
         base.join("proxie").join("config.json")
+    }
+
+    /// Path to the side-car `proxie.json` used by the auto-load-on-startup
+    /// flow. Sits next to `config.json` so users can drop a shared bundle
+    /// in (e.g. a teammate's export) and have it picked up automatically
+    /// when no config exists yet. See [`AppState::maybe_autoload_proxie_json`].
+    pub(crate) fn proxie_json_path() -> PathBuf {
+        let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+        base.join("proxie").join("proxie.json")
     }
 
     fn load_persisted_state() -> PersistedState {
@@ -373,6 +383,126 @@ impl AppState {
             .cloned()
     }
 
+    // Config import / export (v0.4.4)
+
+    /// Build a [`ConfigExport`] snapshot of the user's rule sets plus
+    /// provenance (version + timestamp). The result is intended to be
+    /// pretty-JSON serialized and offered as a `proxie.json` download to the
+    /// user.
+    ///
+    /// # Arguments
+    /// * `version` - String tag stamped into the export (typically
+    ///   `env!("CARGO_PKG_VERSION")` from the caller).
+    ///
+    /// # Returns
+    /// `Ok(String)` containing pretty-printed JSON. `Err` only on the
+    /// extremely unlikely serde failure path.
+    pub async fn export_config(
+        &self,
+        version: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let state = self.persisted.lock().await;
+        let export = build_export(&state, version);
+        let json = serde_json::to_string_pretty(&export)?;
+        Ok(json)
+    }
+
+    /// Apply an import payload to the persisted state and save to disk.
+    ///
+    /// Validates that the payload is a JSON object with the expected shape
+    /// before mutating anything (rule 22 — check input shape first). On
+    /// success the new state is persisted via [`AppState::save`].
+    ///
+    /// # Arguments
+    /// * `json` - Raw JSON string supplied by the frontend (file contents).
+    /// * `mode` - [`ImportMode::Replace`] wipes per-list before applying;
+    ///   [`ImportMode::Merge`] appends, skipping rules with an existing `id`.
+    ///
+    /// # Returns
+    /// [`ImportSummary`] with per-list counts of rules actually added.
+    ///
+    /// # Errors
+    /// `Err(String)` with a user-safe description when:
+    /// * the input is not valid JSON,
+    /// * the top-level value is not a JSON object,
+    /// * deserialization into [`ConfigExport`] fails.
+    /// Raw paths or internal IO errors are NOT leaked into the message.
+    pub async fn import_config(
+        &self,
+        json: &str,
+        mode: ImportMode,
+    ) -> Result<ImportSummary, String> {
+        let parsed: serde_json::Value = serde_json::from_str(json)
+            .map_err(|e| format!("invalid JSON: {}", e))?;
+        if !parsed.is_object() {
+            return Err("expected a JSON object at the top level".to_string());
+        }
+        let export: ConfigExport = serde_json::from_value(parsed)
+            .map_err(|e| format!("invalid config shape: {}", e))?;
+        let summary = {
+            let mut state = self.persisted.lock().await;
+            apply_import(&mut state, mode, export)
+        };
+        self.save().await.map_err(|_| {
+            // Don't leak the on-disk path or raw IO error to the user (rule 16).
+            "failed to persist imported config".to_string()
+        })?;
+        Ok(summary)
+    }
+
+    /// Auto-load `proxie.json` from the config directory when it exists AND
+    /// the current persisted state has no rules of any kind (host / intercept
+    /// / block). Used at app startup so a freshly-installed Proxie can pick
+    /// up a teammate's shared bundle without going through the UI.
+    ///
+    /// Always uses merge mode (idempotent). All outcomes are logged to stderr
+    /// — failure here must never break startup.
+    ///
+    /// # Returns
+    /// `Some(ImportSummary)` when an import ran successfully, `None` when no
+    /// file exists, the state already has rules, or any step failed.
+    pub async fn maybe_autoload_proxie_json(&self) -> Option<ImportSummary> {
+        let path = Self::proxie_json_path();
+        if !path.exists() {
+            return None;
+        }
+        let has_rules = {
+            let state = self.persisted.lock().await;
+            !state.host_rules.is_empty()
+                || !state.intercept_rules.is_empty()
+                || !state.block_rules.is_empty()
+        };
+        let config_exists = Self::config_path().exists();
+        if config_exists && has_rules {
+            eprintln!(
+                "proxie: skipping proxie.json auto-load (existing config has rules)"
+            );
+            return None;
+        }
+        let json = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("proxie: failed to read proxie.json: {}", e);
+                return None;
+            }
+        };
+        match self.import_config(&json, ImportMode::Merge).await {
+            Ok(summary) => {
+                eprintln!(
+                    "proxie: auto-loaded proxie.json (host={}, intercept={}, block={})",
+                    summary.host_rules_added,
+                    summary.intercept_rules_added,
+                    summary.block_rules_added
+                );
+                Some(summary)
+            }
+            Err(e) => {
+                eprintln!("proxie: failed to auto-load proxie.json: {}", e);
+                None
+            }
+        }
+    }
+
     // Connections
     pub async fn get_connections(&self) -> Result<Vec<ConnectionLog>, Box<dyn std::error::Error>> {
         let conns = self.connections.lock().await;
@@ -500,6 +630,82 @@ fn apply_bookmark(conns: &mut [ConnectionLog], id: &str, bookmarked: bool) -> bo
     } else {
         false
     }
+}
+
+/// Build a [`ConfigExport`] snapshot from an arbitrary [`PersistedState`].
+///
+/// Pure / synchronous so tests can exercise it without spinning up an
+/// [`AppState`] (which requires a Tauri `AppHandle`). Stamps the current UTC
+/// time as the `exported_at` field.
+///
+/// # Arguments
+/// * `state` - Persisted state to snapshot. Borrowed only — no mutation.
+/// * `version` - Caller-supplied app version string.
+///
+/// # Returns
+/// A freshly-allocated [`ConfigExport`] cloning every rule list.
+fn build_export(state: &PersistedState, version: &str) -> ConfigExport {
+    ConfigExport {
+        version: version.to_string(),
+        exported_at: chrono::Utc::now()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        host_rules: state.host_rules.clone(),
+        intercept_rules: state.intercept_rules.clone(),
+        block_rules: state.block_rules.clone(),
+    }
+}
+
+/// Fold a [`ConfigExport`] into a [`PersistedState`] under the given mode.
+///
+/// Pure / synchronous so tests can verify replace / merge / dedup semantics
+/// without IO. Returns the per-list counts of rules actually applied.
+///
+/// # Arguments
+/// * `state` - Mutable reference to the persisted state.
+/// * `mode` - [`ImportMode::Replace`] wipes per-list first; [`ImportMode::Merge`]
+///   appends and skips rules whose `id` already exists.
+/// * `export` - Parsed import payload. Consumed.
+///
+/// # Returns
+/// [`ImportSummary`] counting rules added per list. In replace mode this
+/// equals the imported list length; in merge mode it excludes duplicates.
+fn apply_import(
+    state: &mut PersistedState,
+    mode: ImportMode,
+    export: ConfigExport,
+) -> ImportSummary {
+    let mut summary = ImportSummary::default();
+    match mode {
+        ImportMode::Replace => {
+            summary.host_rules_added = export.host_rules.len() as u32;
+            summary.intercept_rules_added = export.intercept_rules.len() as u32;
+            summary.block_rules_added = export.block_rules.len() as u32;
+            state.host_rules = export.host_rules;
+            state.intercept_rules = export.intercept_rules;
+            state.block_rules = export.block_rules;
+        }
+        ImportMode::Merge => {
+            for rule in export.host_rules {
+                if !state.host_rules.iter().any(|r| r.id == rule.id) {
+                    state.host_rules.push(rule);
+                    summary.host_rules_added += 1;
+                }
+            }
+            for rule in export.intercept_rules {
+                if !state.intercept_rules.iter().any(|r| r.id == rule.id) {
+                    state.intercept_rules.push(rule);
+                    summary.intercept_rules_added += 1;
+                }
+            }
+            for rule in export.block_rules {
+                if !state.block_rules.iter().any(|r| r.id == rule.id) {
+                    state.block_rules.push(rule);
+                    summary.block_rules_added += 1;
+                }
+            }
+        }
+    }
+    summary
 }
 
 pub(crate) fn path_matches(pattern: &str, path: &str) -> bool {
@@ -829,6 +1035,158 @@ mod tests {
         let mut conns = vec![make_conn("a", false)];
         assert!(!apply_bookmark(&mut conns, "missing", true));
         assert!(!conns[0].bookmarked);
+    }
+
+    // -------------------------------------------------------------------
+    // v0.4.4 import / export — pure helpers exercised without AppState
+    // (which requires a Tauri AppHandle).
+    // -------------------------------------------------------------------
+
+    fn make_persisted_with_rules() -> PersistedState {
+        PersistedState {
+            proxy_config: ProxyConfig::default(),
+            host_rules: vec![
+                HostRule {
+                    id: "h1".to_string(),
+                    host: "api.example.com".to_string(),
+                    enabled: true,
+                    ignore_paths: vec!["/health".to_string()],
+                },
+                HostRule {
+                    id: "h2".to_string(),
+                    host: "*.staging.example.com".to_string(),
+                    enabled: false,
+                    ignore_paths: vec![],
+                },
+            ],
+            intercept_rules: vec![InterceptRule {
+                id: "ir1".to_string(),
+                name: "mock users".to_string(),
+                enabled: true,
+                match_host: "api.example.com".to_string(),
+                match_path: "/api/users".to_string(),
+                match_method: Some("GET".to_string()),
+                action: InterceptAction::Mock {
+                    response: HarResponse::default(),
+                },
+            }],
+            block_rules: vec![BlockRule {
+                id: "b1".to_string(),
+                host_pattern: "*.doubleclick.net".to_string(),
+                path_pattern: None,
+                enabled: true,
+                note: "ads".to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn test_build_export_includes_all_rule_sets() {
+        let state = make_persisted_with_rules();
+        let exp = build_export(&state, "9.9.9-test");
+        assert_eq!(exp.version, "9.9.9-test");
+        assert!(!exp.exported_at.is_empty());
+        assert_eq!(exp.host_rules.len(), 2);
+        assert_eq!(exp.intercept_rules.len(), 1);
+        assert_eq!(exp.block_rules.len(), 1);
+    }
+
+    #[test]
+    fn test_export_import_round_trip_replace_preserves_rules() {
+        let original = make_persisted_with_rules();
+        let exp = build_export(&original, "test");
+        // Round-trip through JSON to simulate the wire format.
+        let json = serde_json::to_string(&exp).unwrap();
+        let parsed: ConfigExport = serde_json::from_str(&json).unwrap();
+
+        // Apply to an empty state in replace mode.
+        let mut target = PersistedState::default();
+        let summary = apply_import(&mut target, ImportMode::Replace, parsed);
+
+        assert_eq!(summary.host_rules_added, 2);
+        assert_eq!(summary.intercept_rules_added, 1);
+        assert_eq!(summary.block_rules_added, 1);
+        assert_eq!(target.host_rules.len(), 2);
+        assert_eq!(target.intercept_rules.len(), 1);
+        assert_eq!(target.block_rules.len(), 1);
+        // Verify a field survived the round-trip.
+        assert_eq!(target.host_rules[0].host, "api.example.com");
+        assert_eq!(target.block_rules[0].host_pattern, "*.doubleclick.net");
+    }
+
+    #[test]
+    fn test_apply_import_replace_wipes_existing_rules() {
+        let mut target = make_persisted_with_rules();
+        let empty = ConfigExport {
+            version: "test".to_string(),
+            exported_at: "now".to_string(),
+            host_rules: vec![],
+            intercept_rules: vec![],
+            block_rules: vec![],
+        };
+        let summary = apply_import(&mut target, ImportMode::Replace, empty);
+        assert_eq!(summary.host_rules_added, 0);
+        // Replace with an empty export must wipe everything.
+        assert!(target.host_rules.is_empty());
+        assert!(target.intercept_rules.is_empty());
+        assert!(target.block_rules.is_empty());
+    }
+
+    #[test]
+    fn test_apply_import_merge_dedups_by_id() {
+        let mut target = make_persisted_with_rules();
+        // Build an import that has one duplicate (h1) and one fresh (h3).
+        let import = ConfigExport {
+            version: "test".to_string(),
+            exported_at: "now".to_string(),
+            host_rules: vec![
+                HostRule {
+                    id: "h1".to_string(),
+                    host: "api.example.com".to_string(),
+                    enabled: true,
+                    ignore_paths: vec![],
+                },
+                HostRule {
+                    id: "h3".to_string(),
+                    host: "new.example.com".to_string(),
+                    enabled: true,
+                    ignore_paths: vec![],
+                },
+            ],
+            intercept_rules: vec![],
+            block_rules: vec![BlockRule {
+                id: "b1".to_string(), // duplicate
+                host_pattern: "*.doubleclick.net".to_string(),
+                path_pattern: None,
+                enabled: true,
+                note: "dup".to_string(),
+            }],
+        };
+        let summary = apply_import(&mut target, ImportMode::Merge, import);
+        assert_eq!(summary.host_rules_added, 1);
+        assert_eq!(summary.intercept_rules_added, 0);
+        assert_eq!(summary.block_rules_added, 0);
+        // Original h1 is preserved; h3 appended; total = 3.
+        assert_eq!(target.host_rules.len(), 3);
+        assert_eq!(target.block_rules.len(), 1);
+    }
+
+    #[test]
+    fn test_apply_import_merge_into_empty_adds_all() {
+        let mut target = PersistedState::default();
+        let import = build_export(&make_persisted_with_rules(), "test");
+        let summary = apply_import(&mut target, ImportMode::Merge, import);
+        assert_eq!(summary.host_rules_added, 2);
+        assert_eq!(summary.intercept_rules_added, 1);
+        assert_eq!(summary.block_rules_added, 1);
+    }
+
+    #[test]
+    fn test_proxie_json_path_sits_next_to_config() {
+        let cfg = AppState::config_path();
+        let pj = AppState::proxie_json_path();
+        assert_eq!(cfg.parent(), pj.parent());
+        assert!(pj.to_string_lossy().ends_with("proxie.json"));
     }
 
     #[test]
