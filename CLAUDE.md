@@ -42,7 +42,7 @@ src/                           # React frontend
   pages/HostRulesPage.tsx      # Host tracking CRUD
   pages/InterceptorPage.tsx    # Mock/reroute rule CRUD
   pages/BlockRulesPage.tsx     # Pi-hole style block rules
-  pages/SetupPage.tsx          # Proxy config + SSL cert management
+  pages/SetupPage.tsx          # Proxy config + SSL cert + macOS-only Permissions & System Setup card
   test/setup.ts                # Vitest setup with Tauri mocks
 
 src-tauri/src/                 # Rust backend
@@ -52,6 +52,8 @@ src-tauri/src/                 # Rust backend
   state.rs                     # AppState, persistence, rule matching
   tls.rs                       # MITM helpers: LeafCertCache, ServerConfig builder, native upstream connector
   types.rs                     # All data types (CertInfo, HostRule, InterceptRule, BlockRule, ConnectionLog, etc.)
+
+docs/                          # User-facing feature guides (one .md per tab + README index)
 ```
 
 ## Key conventions
@@ -88,6 +90,10 @@ The `coverage` job in `build.yml` runs `cargo llvm-cov --lib --summary-only` fro
 - Per-column filters live in the table header: method / status multi-selects, URL substring, duration / size numeric (operator + value), and a "time window" dropdown. The legacy free-text filter still exists as a global URL/host/method/status contains-search above the table.
 - Response body cards offer a **Format** button (JSON / HTML / XML / CSS / JS), a **Save** button (browser download via `Blob` + `URL.createObjectURL`, works inside the Tauri webview), and a code-generation dropdown that emits **curl**, **Python `requests`**, or **Node `fetch`** snippets so the request can be replayed from a terminal or test script.
 - Binary responses (`image/*`, `video/*`, `audio/*`, `application/pdf`) are stored as `data:` URIs by `parse_response` and rendered with the appropriate HTML media element. Everything else binary shows a "binary content (N bytes)" placeholder with a Save button.
+
+## macOS Permissions card (Setup page)
+
+SetupPage renders a "macOS Permissions & System Setup" card between Proxy Configuration and SSL Certificate. It is gated on the `get_platform` Tauri command returning `"macos"` and is hidden entirely on Linux/Windows. Deep-link buttons shell out via the `open_url` Tauri command (`open` on macOS, `xdg-open` on Linux, `cmd /C start` on Windows). The Local Network row only appears when `ProxyConfig.listen_addr` is non-loopback (anything other than `127.0.0.1`, `::1`, or `localhost`). Network-proxies button tries the Ventura+ `com.apple.Network-Settings.extension?Proxies` URL first and falls back to the legacy `com.apple.preference.network?Proxies` URL.
 
 ## Known MITM limitations
 
