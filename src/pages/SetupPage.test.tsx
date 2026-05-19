@@ -30,6 +30,30 @@ function makeConfig(overrides: Partial<Record<string, unknown>> = {}) {
   };
 }
 
+/**
+ * Build a default `invoke` implementation seeded with the given cert,
+ * config, and platform (`macos` | `linux` | `windows`). Individual tests
+ * can override by passing a richer mock.
+ */
+function makeInvokeMock(opts: {
+  cert?: unknown;
+  config?: ReturnType<typeof makeConfig>;
+  platform?: 'macos' | 'linux' | 'windows';
+  openUrlSpy?: (url: string) => void;
+}) {
+  const { cert = null, config = makeConfig(), platform = 'linux', openUrlSpy } = opts;
+  return async (cmd: string, args?: Record<string, unknown>) => {
+    if (cmd === 'get_cert_info') return cert;
+    if (cmd === 'get_proxy_config') return config;
+    if (cmd === 'get_platform') return platform;
+    if (cmd === 'open_url') {
+      openUrlSpy?.(String(args?.url ?? ''));
+      return undefined;
+    }
+    return undefined;
+  };
+}
+
 describe('SetupPage', () => {
   const invokeMock = invoke as unknown as ReturnType<typeof vi.fn>;
   const openUrlMock = openUrl as unknown as ReturnType<typeof vi.fn>;
@@ -41,11 +65,7 @@ describe('SetupPage', () => {
   });
 
   it('renders proxy config and the "no cert" state initially', async () => {
-    invokeMock.mockImplementation(async (cmd: string) => {
-      if (cmd === 'get_cert_info') return null;
-      if (cmd === 'get_proxy_config') return makeConfig();
-      return undefined;
-    });
+    invokeMock.mockImplementation(makeInvokeMock({}));
 
     render(<SetupPage />);
 
@@ -60,11 +80,7 @@ describe('SetupPage', () => {
   });
 
   it('renders cert details and install instructions when a cert exists', async () => {
-    invokeMock.mockImplementation(async (cmd: string) => {
-      if (cmd === 'get_cert_info') return makeCert();
-      if (cmd === 'get_proxy_config') return makeConfig();
-      return undefined;
-    });
+    invokeMock.mockImplementation(makeInvokeMock({ cert: makeCert() }));
 
     render(<SetupPage />);
 
@@ -98,6 +114,7 @@ describe('SetupPage', () => {
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === 'get_cert_info') return null;
       if (cmd === 'get_proxy_config') return makeConfig();
+      if (cmd === 'get_platform') return 'linux';
       if (cmd === 'generate_cert') return makeCert({ fingerprint: 'FRESH:CERT' });
       return undefined;
     });
@@ -120,6 +137,7 @@ describe('SetupPage', () => {
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === 'get_cert_info') return null;
       if (cmd === 'get_proxy_config') return makeConfig();
+      if (cmd === 'get_platform') return 'linux';
       if (cmd === 'generate_cert') throw new Error('permission denied');
       return undefined;
     });
@@ -143,6 +161,7 @@ describe('SetupPage', () => {
     invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
       if (cmd === 'get_cert_info') return null;
       if (cmd === 'get_proxy_config') return makeConfig();
+      if (cmd === 'get_platform') return 'linux';
       if (cmd === 'update_proxy_config') {
         saved = args?.config as Record<string, unknown>;
         return undefined;
@@ -177,6 +196,7 @@ describe('SetupPage', () => {
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === 'get_cert_info') return null;
       if (cmd === 'get_proxy_config') return makeConfig();
+      if (cmd === 'get_platform') return 'linux';
       if (cmd === 'update_proxy_config') throw new Error('port in use');
       return undefined;
     });
@@ -195,11 +215,7 @@ describe('SetupPage', () => {
 
   it('switching install-instruction tabs swaps the platform body', async () => {
     const user = userEvent.setup();
-    invokeMock.mockImplementation(async (cmd: string) => {
-      if (cmd === 'get_cert_info') return makeCert();
-      if (cmd === 'get_proxy_config') return makeConfig();
-      return undefined;
-    });
+    invokeMock.mockImplementation(makeInvokeMock({ cert: makeCert() }));
 
     render(<SetupPage />);
     await waitFor(() =>
@@ -262,6 +278,7 @@ describe('SetupPage', () => {
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === 'get_cert_info') return null;
       if (cmd === 'get_proxy_config') return makeConfig();
+      if (cmd === 'get_platform') return 'linux';
       if (cmd === 'update_proxy_config') return undefined;
       return undefined;
     });
@@ -280,5 +297,208 @@ describe('SetupPage', () => {
     await waitFor(() => {
       expect(screen.queryByText('Configuration saved')).toBeNull();
     });
+  });
+
+  // ---------------------------------------------------------------------
+  // macOS Permissions & System Setup card
+  // ---------------------------------------------------------------------
+
+  it('renders the macOS Permissions card on macOS', async () => {
+    invokeMock.mockImplementation(makeInvokeMock({ platform: 'macos' }));
+
+    render(<SetupPage />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/macOS Permissions & System Setup/i)).toBeInTheDocument();
+    });
+    expect(screen.getByText(/System Proxy Configuration/i)).toBeInTheDocument();
+    expect(screen.getByText(/Verify CA Certificate/i)).toBeInTheDocument();
+  });
+
+  it('does NOT render the macOS Permissions card on Linux', async () => {
+    invokeMock.mockImplementation(makeInvokeMock({ platform: 'linux' }));
+
+    render(<SetupPage />);
+
+    // Wait for the rest of the page to settle so the macOS card has had a chance to mount.
+    await waitFor(() =>
+      expect(screen.getByText(/No CA certificate found/i)).toBeInTheDocument(),
+    );
+    expect(screen.queryByText(/macOS Permissions & System Setup/i)).toBeNull();
+  });
+
+  it('does NOT render the macOS Permissions card on Windows', async () => {
+    invokeMock.mockImplementation(makeInvokeMock({ platform: 'windows' }));
+
+    render(<SetupPage />);
+
+    await waitFor(() =>
+      expect(screen.getByText(/No CA certificate found/i)).toBeInTheDocument(),
+    );
+    expect(screen.queryByText(/macOS Permissions & System Setup/i)).toBeNull();
+  });
+
+  it('shows the Local Network row only when listen_addr is non-loopback', async () => {
+    invokeMock.mockImplementation(
+      makeInvokeMock({
+        platform: 'macos',
+        config: makeConfig({ listen_addr: '192.168.1.10' }),
+      }),
+    );
+
+    render(<SetupPage />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Local Network access/i)).toBeInTheDocument();
+    });
+    expect(screen.getByRole('button', { name: /Open Privacy & Security/i })).toBeInTheDocument();
+  });
+
+  it('hides the Local Network row for loopback listen_addr (127.0.0.1)', async () => {
+    invokeMock.mockImplementation(makeInvokeMock({ platform: 'macos' }));
+
+    render(<SetupPage />);
+
+    await waitFor(() =>
+      expect(screen.getByText(/macOS Permissions & System Setup/i)).toBeInTheDocument(),
+    );
+    expect(screen.queryByText(/Local Network access/i)).toBeNull();
+  });
+
+  it('hides the Local Network row for ::1 and localhost', async () => {
+    invokeMock.mockImplementation(
+      makeInvokeMock({ platform: 'macos', config: makeConfig({ listen_addr: '::1' }) }),
+    );
+    const { unmount } = render(<SetupPage />);
+    await waitFor(() =>
+      expect(screen.getByText(/macOS Permissions & System Setup/i)).toBeInTheDocument(),
+    );
+    expect(screen.queryByText(/Local Network access/i)).toBeNull();
+    unmount();
+
+    invokeMock.mockReset();
+    invokeMock.mockImplementation(
+      makeInvokeMock({ platform: 'macos', config: makeConfig({ listen_addr: 'LocalHost' }) }),
+    );
+    render(<SetupPage />);
+    await waitFor(() =>
+      expect(screen.getByText(/macOS Permissions & System Setup/i)).toBeInTheDocument(),
+    );
+    expect(screen.queryByText(/Local Network access/i)).toBeNull();
+  });
+
+  it('clicking Open System Settings invokes open_url with the Ventura+ network proxies URL', async () => {
+    const user = userEvent.setup();
+    const opened: string[] = [];
+    invokeMock.mockImplementation(
+      makeInvokeMock({ platform: 'macos', openUrlSpy: (u) => opened.push(u) }),
+    );
+
+    render(<SetupPage />);
+    await waitFor(() =>
+      expect(screen.getByText(/macOS Permissions & System Setup/i)).toBeInTheDocument(),
+    );
+
+    await user.click(screen.getByRole('button', { name: /Open System Settings/i }));
+
+    await waitFor(() => {
+      expect(opened).toContain(
+        'x-apple.systempreferences:com.apple.Network-Settings.extension?Proxies',
+      );
+    });
+  });
+
+  it('clicking Open Keychain Access invokes open_url with the keychainaccess URL', async () => {
+    const user = userEvent.setup();
+    const opened: string[] = [];
+    invokeMock.mockImplementation(
+      makeInvokeMock({ platform: 'macos', openUrlSpy: (u) => opened.push(u) }),
+    );
+
+    render(<SetupPage />);
+    await waitFor(() =>
+      expect(screen.getByText(/macOS Permissions & System Setup/i)).toBeInTheDocument(),
+    );
+
+    await user.click(screen.getByRole('button', { name: /Open Keychain Access/i }));
+
+    await waitFor(() => {
+      expect(
+        opened.some(
+          (u) =>
+            u === 'keychainaccess:' ||
+            u === '/System/Applications/Utilities/Keychain Access.app',
+        ),
+      ).toBe(true);
+    });
+  });
+
+  it('clicking Open Privacy & Security invokes open_url with the LocalNetwork pane URL', async () => {
+    const user = userEvent.setup();
+    const opened: string[] = [];
+    invokeMock.mockImplementation(
+      makeInvokeMock({
+        platform: 'macos',
+        config: makeConfig({ listen_addr: '0.0.0.0' }),
+        openUrlSpy: (u) => opened.push(u),
+      }),
+    );
+
+    render(<SetupPage />);
+    await waitFor(() => expect(screen.getByText(/Local Network access/i)).toBeInTheDocument());
+
+    await user.click(screen.getByRole('button', { name: /Open Privacy & Security/i }));
+
+    await waitFor(() => {
+      expect(opened).toContain(
+        'x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork',
+      );
+    });
+  });
+
+  it('falls back to the legacy network-proxy URL when the modern URL fails', async () => {
+    const user = userEvent.setup();
+    const opened: string[] = [];
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === 'get_cert_info') return null;
+      if (cmd === 'get_proxy_config') return makeConfig();
+      if (cmd === 'get_platform') return 'macos';
+      if (cmd === 'open_url') {
+        const url = String(args?.url ?? '');
+        opened.push(url);
+        if (url.includes('Network-Settings.extension')) {
+          throw new Error('not registered');
+        }
+        return undefined;
+      }
+      return undefined;
+    });
+
+    render(<SetupPage />);
+    await waitFor(() =>
+      expect(screen.getByText(/macOS Permissions & System Setup/i)).toBeInTheDocument(),
+    );
+
+    await user.click(screen.getByRole('button', { name: /Open System Settings/i }));
+
+    await waitFor(() => {
+      // Legacy URL is attempted after the modern one fails.
+      expect(opened).toEqual([
+        'x-apple.systempreferences:com.apple.Network-Settings.extension?Proxies',
+        'x-apple.systempreferences:com.apple.preference.network?Proxies',
+      ]);
+    });
+  });
+
+  it('renders the FAQ accordion about Full Disk Access / Accessibility / Notifications', async () => {
+    invokeMock.mockImplementation(makeInvokeMock({ platform: 'macos' }));
+
+    render(<SetupPage />);
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(/What about Full Disk Access, Accessibility, Notifications\?/i),
+      ).toBeInTheDocument(),
+    );
   });
 });
