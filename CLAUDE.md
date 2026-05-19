@@ -52,6 +52,8 @@ src-tauri/src/                 # Rust backend
   state.rs                     # AppState, persistence, rule matching
   tls.rs                       # MITM helpers: LeafCertCache, ServerConfig builder, native upstream connector
   types.rs                     # All data types (CertInfo, HostRule, InterceptRule, BlockRule, ConnectionLog, etc.)
+
+docs/                          # User-facing feature guides (one .md per tab + README index)
 ```
 
 ## Key conventions

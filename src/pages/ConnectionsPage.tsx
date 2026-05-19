@@ -22,6 +22,7 @@ import {
   Button,
   Snackbar,
   Alert,
+  InputAdornment,
 } from '@mui/material';
 import type { SelectChangeEvent } from '@mui/material';
 import DeleteSweepIcon from '@mui/icons-material/DeleteSweep';
@@ -32,11 +33,20 @@ import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import StarIcon from '@mui/icons-material/Star';
 import StarBorderIcon from '@mui/icons-material/StarBorder';
 import FileDownloadIcon from '@mui/icons-material/FileDownload';
+import SearchIcon from '@mui/icons-material/Search';
 import { Menu } from '@mui/material';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { CODEGEN, CODEGEN_LANGS, generateBundle } from '../lib/codegen';
 import { connectionsToHar } from '../lib/har';
+import {
+  ColumnsButton,
+  loadVisibleColumns,
+  saveVisibleColumns,
+  bodyPreview,
+  pickContentType,
+  type ColumnSpec,
+} from '../components/ConnectionsColumnPicker';
 
 interface ConnectionLog {
   id: string;
@@ -397,6 +407,29 @@ function matchesColumnFilters(c: ConnectionLog, f: ColumnFilters, now: number): 
 }
 
 // ---------------------------------------------------------------------------
+// Column registry — drives both the header row and per-row cell rendering.
+// ---------------------------------------------------------------------------
+
+/**
+ * Authoritative list of columns the user can show / hide on the connections
+ * table. The six original columns default to visible; the four new content
+ * preview columns default to hidden so existing users don't see a layout
+ * shock on upgrade.
+ */
+const COLUMNS: ColumnSpec[] = [
+  { key: 'method', label: 'Method', defaultVisible: true },
+  { key: 'url', label: 'URL', defaultVisible: true },
+  { key: 'status', label: 'Status', defaultVisible: true },
+  { key: 'duration', label: 'Duration', defaultVisible: true },
+  { key: 'size', label: 'Size', defaultVisible: true },
+  { key: 'time', label: 'Time', defaultVisible: true },
+  { key: 'request_content_type', label: 'Req Content-Type', defaultVisible: false },
+  { key: 'response_content_type', label: 'Resp Content-Type', defaultVisible: false },
+  { key: 'request_body', label: 'Request Body', defaultVisible: false },
+  { key: 'response_body', label: 'Response Body', defaultVisible: false },
+];
+
+// ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
 
@@ -404,6 +437,9 @@ export default function ConnectionsPage() {
   const [connections, setConnections] = useState<ConnectionLog[]>([]);
   const [filter, setFilter] = useState('');
   const [colFilters, setColFilters] = useState<ColumnFilters>(DEFAULT_FILTERS);
+  const [visibleColumns, setVisibleColumns] = useState<Set<string>>(() =>
+    loadVisibleColumns(COLUMNS),
+  );
   const [selected, setSelected] = useState<ConnectionLog | null>(null);
   const [toast, setToast] = useState<{ kind: 'success' | 'error' | 'info'; msg: string } | null>(
     null,
@@ -492,6 +528,17 @@ export default function ConnectionsPage() {
     }
   }, []);
 
+  const updateVisibleColumns = useCallback((next: Set<string>) => {
+    setVisibleColumns(next);
+    saveVisibleColumns(next);
+  }, []);
+
+  const isVisible = useCallback((key: string) => visibleColumns.has(key), [visibleColumns]);
+  const visibleSpecs = useMemo(
+    () => COLUMNS.filter((c) => visibleColumns.has(c.key)),
+    [visibleColumns],
+  );
+
   const filtered = useMemo(() => {
     const now = Date.now();
     return connections.filter((c) => {
@@ -512,16 +559,25 @@ export default function ConnectionsPage() {
     <Box sx={{ display: 'flex', height: 'calc(100vh - 80px)' }}>
       <Box sx={{ flexGrow: 1, display: 'flex', flexDirection: 'column' }}>
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
-          <Typography variant='h5' sx={{ flexGrow: 1 }}>
-            Connections
-          </Typography>
-          <TextField
-            placeholder='Filter by URL, host, method, status...'
-            value={filter}
-            onChange={(e) => setFilter(e.target.value)}
-            size='small'
-            sx={{ width: 300 }}
-          />
+          <Typography variant='h5'>Connections</Typography>
+          <Box sx={{ flex: 1 }}>
+            <TextField
+              placeholder='Filter by URL, host, method, status...'
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              size='small'
+              fullWidth
+              slotProps={{
+                input: {
+                  startAdornment: (
+                    <InputAdornment position='start'>
+                      <SearchIcon fontSize='small' />
+                    </InputAdornment>
+                  ),
+                },
+              }}
+            />
+          </Box>
           <ExportMenu connections={filtered} allConnections={connections} />
           <Tooltip title='Refresh'>
             <IconButton size='small' onClick={loadConnections}>
@@ -533,6 +589,11 @@ export default function ConnectionsPage() {
               <DeleteSweepIcon />
             </IconButton>
           </Tooltip>
+          <ColumnsButton
+            columns={COLUMNS}
+            visible={visibleColumns}
+            onChange={updateVisibleColumns}
+          />
         </Box>
 
         <Card sx={{ flexGrow: 1, overflow: 'auto' }}>
@@ -542,23 +603,32 @@ export default function ConnectionsPage() {
                 <TableCell width={44} padding='none' align='center'>
                   ★
                 </TableCell>
-                <TableCell width={120}>Method</TableCell>
-                <TableCell>URL</TableCell>
-                <TableCell width={90}>Status</TableCell>
-                <TableCell width={170}>Duration</TableCell>
-                <TableCell width={130}>Size</TableCell>
-                <TableCell width={130}>Time</TableCell>
+                {isVisible('method') && <TableCell width={120}>Method</TableCell>}
+                {isVisible('url') && <TableCell>URL</TableCell>}
+                {isVisible('status') && <TableCell width={90}>Status</TableCell>}
+                {isVisible('duration') && <TableCell width={170}>Duration</TableCell>}
+                {isVisible('size') && <TableCell width={130}>Size</TableCell>}
+                {isVisible('time') && <TableCell width={130}>Time</TableCell>}
+                {isVisible('request_content_type') && (
+                  <TableCell width={160}>Req Content-Type</TableCell>
+                )}
+                {isVisible('response_content_type') && (
+                  <TableCell width={160}>Resp Content-Type</TableCell>
+                )}
+                {isVisible('request_body') && <TableCell>Request Body</TableCell>}
+                {isVisible('response_body') && <TableCell>Response Body</TableCell>}
               </TableRow>
               <FilterRow
                 filters={colFilters}
                 setFilters={setColFilters}
                 onReset={() => setColFilters(DEFAULT_FILTERS)}
+                isVisible={isVisible}
               />
             </TableHead>
             <TableBody>
               {filtered.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={7} align='center' sx={{ py: 4 }}>
+                  <TableCell colSpan={(visibleSpecs.length || 0) + 1} align='center' sx={{ py: 4 }}>
                     <Typography variant='body2' color='text.secondary'>
                       {connections.length === 0
                         ? 'No connections yet. Start the proxy and configure your system to use it.'
@@ -595,71 +665,135 @@ export default function ConnectionsPage() {
                       </IconButton>
                     </Tooltip>
                   </TableCell>
-                  <TableCell>
-                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-                      <Chip label={conn.method} size='small' variant='outlined' />
-                      {conn.intercepted && (
-                        <Tooltip title='Response served by an intercept rule (mock or reroute)'>
-                          <Chip
-                            label='INTERCEPTED'
-                            size='small'
-                            color='secondary'
-                            data-testid='intercepted-badge'
-                            sx={{
-                              fontSize: '0.65rem',
-                              height: 18,
-                              '& .MuiChip-label': { px: 0.75 },
-                            }}
-                          />
-                        </Tooltip>
+                  {isVisible('method') && (
+                    <TableCell>
+                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                        <Chip label={conn.method} size='small' variant='outlined' />
+                        {conn.intercepted && (
+                          <Tooltip title='Response served by an intercept rule (mock or reroute)'>
+                            <Chip
+                              label='INTERCEPTED'
+                              size='small'
+                              color='secondary'
+                              data-testid='intercepted-badge'
+                              sx={{
+                                fontSize: '0.65rem',
+                                height: 18,
+                                '& .MuiChip-label': { px: 0.75 },
+                              }}
+                            />
+                          </Tooltip>
+                        )}
+                        {conn.blocked && (
+                          <Tooltip title='Request blocked by a block rule (Pi-hole style)'>
+                            <Chip
+                              label='BLOCKED'
+                              size='small'
+                              color='error'
+                              data-testid='blocked-badge'
+                              sx={{
+                                fontSize: '0.65rem',
+                                height: 18,
+                                '& .MuiChip-label': { px: 0.75 },
+                              }}
+                            />
+                          </Tooltip>
+                        )}
+                      </Box>
+                    </TableCell>
+                  )}
+                  {isVisible('url') && (
+                    <TableCell
+                      sx={{
+                        maxWidth: 400,
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                      }}>
+                      {conn.url}
+                    </TableCell>
+                  )}
+                  {isVisible('status') && (
+                    <TableCell>
+                      {conn.status && (
+                        <Chip
+                          label={conn.status}
+                          size='small'
+                          color={statusColor(conn.status)}
+                          variant='outlined'
+                        />
                       )}
-                      {conn.blocked && (
-                        <Tooltip title='Request blocked by a block rule (Pi-hole style)'>
-                          <Chip
-                            label='BLOCKED'
-                            size='small'
-                            color='error'
-                            data-testid='blocked-badge'
-                            sx={{
-                              fontSize: '0.65rem',
-                              height: 18,
-                              '& .MuiChip-label': { px: 0.75 },
-                            }}
-                          />
-                        </Tooltip>
-                      )}
-                    </Box>
-                  </TableCell>
-                  <TableCell
-                    sx={{
-                      maxWidth: 400,
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis',
-                      whiteSpace: 'nowrap',
-                    }}>
-                    {conn.url}
-                  </TableCell>
-                  <TableCell>
-                    {conn.status && (
-                      <Chip
-                        label={conn.status}
-                        size='small'
-                        color={statusColor(conn.status)}
-                        variant='outlined'
-                      />
-                    )}
-                  </TableCell>
-                  <TableCell>
-                    <DurationBar ms={conn.duration_ms} />
-                  </TableCell>
-                  <TableCell>
-                    <Typography variant='caption'>{formatBytes(conn.response_size)}</Typography>
-                  </TableCell>
-                  <TableCell>
-                    <Typography variant='caption'>
-                      {new Date(conn.timestamp).toLocaleTimeString()}
-                    </Typography>
-                  </TableCell>
+                    </TableCell>
+                  )}
+                  {isVisible('duration') && (
+                    <TableCell>
+                      <DurationBar ms={conn.duration_ms} />
+                    </TableCell>
+                  )}
+                  {isVisible('size') && (
+                    <TableCell>
+                      <Typography variant='caption'>
+                        {formatBytes(conn.response_size)}
+                      </Typography>
+                    </TableCell>
+                  )}
+                  {isVisible('time') && (
+                    <TableCell>
+                      <Typography variant='caption'>
+                        {new Date(conn.timestamp).toLocaleTimeString()}
+                      </Typography>
+                    </TableCell>
+                  )}
+                  {isVisible('request_content_type') && (
+                    <TableCell data-testid='cell-request_content_type'>
+                      <Typography
+                        variant='caption'
+                        sx={{ fontFamily: 'monospace', fontSize: '0.7rem' }}>
+                        {pickContentType(conn.request_headers)}
+                      </Typography>
+                    </TableCell>
+                  )}
+                  {isVisible('response_content_type') && (
+                    <TableCell data-testid='cell-response_content_type'>
+                      <Typography
+                        variant='caption'
+                        sx={{ fontFamily: 'monospace', fontSize: '0.7rem' }}>
+                        {pickContentType(conn.response_headers)}
+                      </Typography>
+                    </TableCell>
+                  )}
+                  {isVisible('request_body') && (
+                    <TableCell
+                      data-testid='cell-request_body'
+                      sx={{
+                        maxWidth: 320,
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                      }}>
+                      <Typography
+                        variant='caption'
+                        sx={{ fontFamily: 'monospace', fontSize: '0.7rem' }}>
+                        {bodyPreview(conn.request_body)}
+                      </Typography>
+                    </TableCell>
+                  )}
+                  {isVisible('response_body') && (
+                    <TableCell
+                      data-testid='cell-response_body'
+                      sx={{
+                        maxWidth: 320,
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                      }}>
+                      <Typography
+                        variant='caption'
+                        sx={{ fontFamily: 'monospace', fontSize: '0.7rem' }}>
+                        {bodyPreview(conn.response_body)}
+                      </Typography>
+                    </TableCell>
+                  )}
                 </TableRow>
               ))}
               <tr ref={bottomRef as React.RefObject<HTMLTableRowElement>} style={{ display: 'none' }} />
@@ -705,10 +839,12 @@ function FilterRow({
   filters,
   setFilters,
   onReset,
+  isVisible,
 }: {
   filters: ColumnFilters;
   setFilters: (next: ColumnFilters) => void;
   onReset: () => void;
+  isVisible: (key: string) => boolean;
 }) {
   const onMethods = (e: SelectChangeEvent<string[]>) =>
     setFilters({ ...filters, methods: typeof e.target.value === 'string' ? [] : e.target.value });
@@ -729,129 +865,145 @@ function FilterRow({
   return (
     <TableRow data-testid='column-filter-row' sx={{ '& > th': { py: 0.5 } }}>
       <TableCell padding='none' />
-      <TableCell>
-        <FormControl size='small' fullWidth>
-          <Select
-            data-testid='method-filter'
-            multiple
-            displayEmpty
-            value={filters.methods}
-            onChange={onMethods}
-            input={<OutlinedInput sx={{ fontSize: '0.75rem' }} />}
-            renderValue={(s) => (s.length === 0 ? 'Any' : s.join(','))}>
-            {METHOD_OPTIONS.map((m) => (
-              <MenuItem key={m} value={m}>
-                {m}
-              </MenuItem>
-            ))}
-          </Select>
-        </FormControl>
-      </TableCell>
-      <TableCell>
-        <TextField
-          data-testid='url-filter'
-          placeholder='contains...'
-          value={filters.urlContains}
-          onChange={(e) => setFilters({ ...filters, urlContains: e.target.value })}
-          size='small'
-          fullWidth
-          slotProps={{ htmlInput: { style: { fontSize: '0.75rem', padding: 6 } } }}
-        />
-        {hasAnyFilter && (
-          <Button
-            data-testid='reset-filters'
-            size='small'
-            onClick={onReset}
-            sx={{ mt: 0.5, fontSize: '0.65rem', minWidth: 0, py: 0 }}>
-            reset filters
-          </Button>
-        )}
-      </TableCell>
-      <TableCell>
-        <FormControl size='small' fullWidth>
-          <Select
-            data-testid='status-filter'
-            multiple
-            displayEmpty
-            value={filters.statusBuckets}
-            onChange={onStatuses}
-            input={<OutlinedInput sx={{ fontSize: '0.75rem' }} />}
-            renderValue={(s) => (s.length === 0 ? 'Any' : s.join(','))}>
-            {STATUS_BUCKETS.map((b) => (
-              <MenuItem key={b.label} value={b.label}>
-                {b.label}
-              </MenuItem>
-            ))}
-          </Select>
-        </FormControl>
-      </TableCell>
-      <TableCell>
-        <Stack direction='row' spacing={0.5}>
-          <Select
-            data-testid='duration-op'
-            size='small'
-            value={filters.durationOp}
-            onChange={(e) =>
-              setFilters({ ...filters, durationOp: e.target.value as Op })
-            }
-            sx={{ fontSize: '0.75rem', width: 60 }}>
-            <MenuItem value='>='>≥</MenuItem>
-            <MenuItem value='<='>≤</MenuItem>
-          </Select>
+      {isVisible('method') && (
+        <TableCell>
+          <FormControl size='small' fullWidth>
+            <Select
+              data-testid='method-filter'
+              multiple
+              displayEmpty
+              value={filters.methods}
+              onChange={onMethods}
+              input={<OutlinedInput sx={{ fontSize: '0.75rem' }} />}
+              renderValue={(s) => (s.length === 0 ? 'Any' : s.join(','))}>
+              {METHOD_OPTIONS.map((m) => (
+                <MenuItem key={m} value={m}>
+                  {m}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+        </TableCell>
+      )}
+      {isVisible('url') && (
+        <TableCell>
           <TextField
-            data-testid='duration-value'
-            placeholder='ms'
+            data-testid='url-filter'
+            placeholder='contains...'
+            value={filters.urlContains}
+            onChange={(e) => setFilters({ ...filters, urlContains: e.target.value })}
             size='small'
-            value={filters.durationValue}
-            onChange={(e) => setFilters({ ...filters, durationValue: e.target.value })}
-            slotProps={{
-              htmlInput: { inputMode: 'numeric', style: { fontSize: '0.75rem', padding: 6 } },
-            }}
+            fullWidth
+            slotProps={{ htmlInput: { style: { fontSize: '0.75rem', padding: 6 } } }}
           />
-        </Stack>
-      </TableCell>
-      <TableCell>
-        <Stack direction='row' spacing={0.5}>
-          <Select
-            data-testid='size-op'
-            size='small'
-            value={filters.sizeOp}
-            onChange={(e) => setFilters({ ...filters, sizeOp: e.target.value as Op })}
-            sx={{ fontSize: '0.75rem', width: 60 }}>
-            <MenuItem value='>='>≥</MenuItem>
-            <MenuItem value='<='>≤</MenuItem>
-          </Select>
-          <TextField
-            data-testid='size-value'
-            placeholder='B'
-            size='small'
-            value={filters.sizeValue}
-            onChange={(e) => setFilters({ ...filters, sizeValue: e.target.value })}
-            slotProps={{
-              htmlInput: { inputMode: 'numeric', style: { fontSize: '0.75rem', padding: 6 } },
-            }}
-          />
-        </Stack>
-      </TableCell>
-      <TableCell>
-        <FormControl size='small' fullWidth>
-          <Select
-            data-testid='time-window'
-            value={filters.timeWindowMs == null ? '' : String(filters.timeWindowMs)}
-            onChange={(e) => {
-              const v = e.target.value;
-              setFilters({ ...filters, timeWindowMs: v === '' ? null : Number(v) });
-            }}
-            displayEmpty
-            sx={{ fontSize: '0.75rem' }}>
-            {TIME_WINDOWS.map((w) => (
-              <MenuItem key={w.label} value={w.ms == null ? '' : String(w.ms)}>
-                {w.label}
-              </MenuItem>
-            ))}
-          </Select>
-        </FormControl>
-      </TableCell>
+          {hasAnyFilter && (
+            <Button
+              data-testid='reset-filters'
+              size='small'
+              onClick={onReset}
+              sx={{ mt: 0.5, fontSize: '0.65rem', minWidth: 0, py: 0 }}>
+              reset filters
+            </Button>
+          )}
+        </TableCell>
+      )}
+      {isVisible('status') && (
+        <TableCell>
+          <FormControl size='small' fullWidth>
+            <Select
+              data-testid='status-filter'
+              multiple
+              displayEmpty
+              value={filters.statusBuckets}
+              onChange={onStatuses}
+              input={<OutlinedInput sx={{ fontSize: '0.75rem' }} />}
+              renderValue={(s) => (s.length === 0 ? 'Any' : s.join(','))}>
+              {STATUS_BUCKETS.map((b) => (
+                <MenuItem key={b.label} value={b.label}>
+                  {b.label}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+        </TableCell>
+      )}
+      {isVisible('duration') && (
+        <TableCell>
+          <Stack direction='row' spacing={0.5}>
+            <Select
+              data-testid='duration-op'
+              size='small'
+              value={filters.durationOp}
+              onChange={(e) =>
+                setFilters({ ...filters, durationOp: e.target.value as Op })
+              }
+              sx={{ fontSize: '0.75rem', width: 60 }}>
+              <MenuItem value='>='>≥</MenuItem>
+              <MenuItem value='<='>≤</MenuItem>
+            </Select>
+            <TextField
+              data-testid='duration-value'
+              placeholder='ms'
+              size='small'
+              value={filters.durationValue}
+              onChange={(e) => setFilters({ ...filters, durationValue: e.target.value })}
+              slotProps={{
+                htmlInput: { inputMode: 'numeric', style: { fontSize: '0.75rem', padding: 6 } },
+              }}
+            />
+          </Stack>
+        </TableCell>
+      )}
+      {isVisible('size') && (
+        <TableCell>
+          <Stack direction='row' spacing={0.5}>
+            <Select
+              data-testid='size-op'
+              size='small'
+              value={filters.sizeOp}
+              onChange={(e) => setFilters({ ...filters, sizeOp: e.target.value as Op })}
+              sx={{ fontSize: '0.75rem', width: 60 }}>
+              <MenuItem value='>='>≥</MenuItem>
+              <MenuItem value='<='>≤</MenuItem>
+            </Select>
+            <TextField
+              data-testid='size-value'
+              placeholder='B'
+              size='small'
+              value={filters.sizeValue}
+              onChange={(e) => setFilters({ ...filters, sizeValue: e.target.value })}
+              slotProps={{
+                htmlInput: { inputMode: 'numeric', style: { fontSize: '0.75rem', padding: 6 } },
+              }}
+            />
+          </Stack>
+        </TableCell>
+      )}
+      {isVisible('time') && (
+        <TableCell>
+          <FormControl size='small' fullWidth>
+            <Select
+              data-testid='time-window'
+              value={filters.timeWindowMs == null ? '' : String(filters.timeWindowMs)}
+              onChange={(e) => {
+                const v = e.target.value;
+                setFilters({ ...filters, timeWindowMs: v === '' ? null : Number(v) });
+              }}
+              displayEmpty
+              sx={{ fontSize: '0.75rem' }}>
+              {TIME_WINDOWS.map((w) => (
+                <MenuItem key={w.label} value={w.ms == null ? '' : String(w.ms)}>
+                  {w.label}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+        </TableCell>
+      )}
+      {isVisible('request_content_type') && <TableCell />}
+      {isVisible('response_content_type') && <TableCell />}
+      {isVisible('request_body') && <TableCell />}
+      {isVisible('response_body') && <TableCell />}
     </TableRow>
   );
 }
@@ -1148,6 +1300,21 @@ function BodyPreview({
         />
       );
     }
+    return (
+      <Typography
+        data-testid='body-preview-binary-placeholder'
+        variant='caption'
+        color='text.secondary'>
+        Binary content — {decoded.mime} ({formatBytes(decoded.byteLength)}). Use "Save" to
+        download.
+      </Typography>
+    );
+  }
+
+  // Suppress `<pre>` for opaque binary payloads even when the body wasn't
+  // encoded as a `data:` URI — `application/octet-stream` bytes are typically
+  // compressed / encrypted noise and render as garbled text.
+  if (decoded.mime.toLowerCase().startsWith('application/octet-stream')) {
     return (
       <Typography
         data-testid='body-preview-binary-placeholder'

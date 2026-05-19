@@ -5,6 +5,140 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// Maximum total time we will spend reading bytes from an upstream socket
+/// before giving up and returning a 504 Gateway Timeout to the client.
+///
+/// Picked to be generous enough for slow CDNs / large payloads, but small
+/// enough that bot-detection endpoints (e.g. tesla.com's anti-bot probes)
+/// which accept the request and then trickle/hold the connection forever
+/// cannot wedge a browser tab indefinitely.
+const UPSTREAM_TOTAL_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Per-`read()` chunk timeout once the upstream has accepted bytes but
+/// stops sending. Smaller than the total deadline so a fully idle socket
+/// is detected quickly without waiting the full 60s when nothing is
+/// happening.
+const UPSTREAM_IDLE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Body capture cap for `ConnectionLog`. Anything beyond this is still
+/// forwarded to the client, but the recorded `response_body` is replaced
+/// with a placeholder to keep memory and the UI bounded.
+const RESPONSE_BODY_CAPTURE_CAP: usize = 5 * 1024 * 1024;
+
+/// Outcome of [`read_upstream_to_end`] — distinguishes "upstream completed"
+/// from "we gave up after the timeout" so callers can emit a 504 instead of
+/// forwarding a half-baked response.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum UpstreamReadOutcome {
+    /// Upstream signalled EOF cleanly within the deadline.
+    Eof,
+    /// Upstream errored (connection reset, TLS close, etc.). Treated as a
+    /// terminal-but-graceful end-of-stream.
+    Errored,
+    /// We hit the size cap configured for the read loop; bytes after the
+    /// cap were discarded.
+    SizeCapped,
+    /// We exceeded `UPSTREAM_TOTAL_READ_TIMEOUT` (or the per-read idle
+    /// timeout) before the upstream finished sending.
+    TimedOut,
+}
+
+/// Read from any `AsyncRead` upstream into `buf` until EOF, error, the
+/// size cap, or one of the timeouts fires.
+///
+/// # Parameters
+/// - `upstream` — any `AsyncRead + Unpin` (TCP, TLS-wrapped TCP, or a test
+///   mock).
+/// - `buf` — destination buffer. Pre-allocate when you know an upper bound.
+/// - `size_cap` — hard ceiling on bytes appended to `buf`; further reads
+///   stop once exceeded. Use [`usize::MAX`] to disable.
+/// - `total_timeout` — wall-clock budget for the entire read loop.
+/// - `idle_timeout` — per-`read()` timeout for the next chunk.
+///
+/// # Returns
+/// One of [`UpstreamReadOutcome`] variants indicating why the loop stopped.
+/// `Eof`/`Errored`/`SizeCapped` are success-ish ("forward what we have");
+/// `TimedOut` means the caller should reply with 504 Gateway Timeout.
+pub(crate) async fn read_upstream_to_end<R>(
+    upstream: &mut R,
+    buf: &mut Vec<u8>,
+    size_cap: usize,
+    total_timeout: std::time::Duration,
+    idle_timeout: std::time::Duration,
+) -> UpstreamReadOutcome
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + total_timeout;
+    let mut tmp = vec![0u8; 16 * 1024];
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return UpstreamReadOutcome::TimedOut;
+        }
+        let remaining = deadline - now;
+        let chunk_budget = if remaining < idle_timeout {
+            remaining
+        } else {
+            idle_timeout
+        };
+        match tokio::time::timeout(chunk_budget, upstream.read(&mut tmp)).await {
+            Ok(Ok(0)) => return UpstreamReadOutcome::Eof,
+            Ok(Ok(n)) => {
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.len() >= size_cap {
+                    return UpstreamReadOutcome::SizeCapped;
+                }
+            }
+            Ok(Err(_)) => return UpstreamReadOutcome::Errored,
+            Err(_) => return UpstreamReadOutcome::TimedOut,
+        }
+    }
+}
+
+/// Truncate a captured `response_body` for `ConnectionLog` if the raw
+/// upstream payload exceeded [`RESPONSE_BODY_CAPTURE_CAP`].
+///
+/// # Parameters
+/// - `body` — the parsed body string (already decompressed / decoded) that
+///   would otherwise be stored verbatim.
+/// - `raw_len` — length in bytes of the raw upstream response (headers +
+///   body). Used as the size signal for the cap.
+///
+/// # Returns
+/// `body` unchanged when under the cap; a placeholder string of the form
+/// `"<body too large; N bytes streamed>"` when over. Bytes still go to the
+/// client unmodified — the cap only affects the in-memory log.
+pub(crate) fn cap_logged_response_body(
+    body: Option<String>,
+    raw_len: usize,
+) -> Option<String> {
+    if raw_len > RESPONSE_BODY_CAPTURE_CAP {
+        return Some(format!("<body too large; {} bytes streamed>", raw_len));
+    }
+    body
+}
+
+/// Build the raw HTTP/1.1 response bytes returned to the client when the
+/// upstream stalled past [`UPSTREAM_TOTAL_READ_TIMEOUT`].
+///
+/// `note` is embedded in the response body so the user can see why the
+/// request failed in their browser's network tab.
+pub fn build_gateway_timeout_response_bytes(note: &str) -> Vec<u8> {
+    let body = format!(
+        "504 Gateway Timeout\n\nProxie: {}\n\nThe upstream server accepted the request but did not finish sending a response within the configured timeout.",
+        note
+    );
+    let mut resp = String::from("HTTP/1.1 504 Gateway Timeout\r\n");
+    resp.push_str("Content-Type: text/plain; charset=utf-8\r\n");
+    resp.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    resp.push_str("Connection: close\r\n");
+    resp.push_str("X-Proxie-Error: upstream-read-timeout\r\n\r\n");
+    let mut bytes = resp.into_bytes();
+    bytes.extend_from_slice(body.as_bytes());
+    bytes
+}
+
 /// Start the HTTP/HTTPS proxy server.
 pub async fn start_proxy(
     app_handle: AppHandle,
@@ -498,19 +632,62 @@ async fn mitm_connect(
         return Ok(());
     }
 
-    // Read the full upstream response (header + body, bounded read loop).
+    // Read the full upstream response (header + body, bounded read loop)
+    // with a hard timeout so a stalled upstream (e.g. tesla.com bot-probe
+    // endpoints which hold the socket open without sending bytes) cannot
+    // wedge the browser tab indefinitely.
     let mut response_buf = Vec::with_capacity(8192);
-    let mut tmp = vec![0u8; 16 * 1024];
-    loop {
-        match upstream_tls.read(&mut tmp).await {
-            Ok(0) => break,
-            Ok(n) => response_buf.extend_from_slice(&tmp[..n]),
-            Err(_) => break,
-        }
-        if response_buf.len() > 8 * 1024 * 1024 {
-            // Cap at 8 MiB to avoid runaway memory on streaming responses.
-            break;
-        }
+    let outcome = read_upstream_to_end(
+        &mut upstream_tls,
+        &mut response_buf,
+        8 * 1024 * 1024,
+        UPSTREAM_TOTAL_READ_TIMEOUT,
+        UPSTREAM_IDLE_READ_TIMEOUT,
+    )
+    .await;
+
+    if outcome == UpstreamReadOutcome::TimedOut {
+        // Upstream stalled. Tell the client and log a 504 instead of
+        // forwarding whatever truncated bytes we managed to read.
+        let note = format!(
+            "Upstream read timeout after {}s ({}{})",
+            UPSTREAM_TOTAL_READ_TIMEOUT.as_secs(),
+            target,
+            if response_buf.is_empty() {
+                ""
+            } else {
+                "; partial bytes discarded"
+            },
+        );
+        let timeout_resp = build_gateway_timeout_response_bytes(&note);
+        let _ = tls_client.write_all(&timeout_resp).await;
+        let _ = tls_client.shutdown().await;
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let conn = ConnectionLog {
+            id: uuid::Uuid::new_v4().to_string(),
+            method,
+            url,
+            host: host.to_string(),
+            path,
+            status: Some(504),
+            duration_ms: Some(duration_ms),
+            request_size: Some(request_data.len() as u64),
+            response_size: Some(timeout_resp.len() as u64),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            request_headers,
+            response_headers: vec![],
+            request_body,
+            response_body: Some(format!("Proxie: {}", note)),
+            content_type: Some("text/plain; charset=utf-8".to_string()),
+            intercepted: false,
+            blocked: false,
+            bookmarked: false,
+        };
+        state.add_connection(conn.clone()).await;
+        let _ = app_handle.emit("proxy:connection", &conn);
+        log::warn!("MITM {}: {}", target, note);
+        return Ok(());
     }
 
     // Forward response to client.
@@ -521,6 +698,10 @@ async fn mitm_connect(
 
     // Parse response status + headers + body for the connection log.
     let (status, response_headers, response_body, content_type) = parse_response(&response_buf);
+    // Cap the captured body so a single huge streamed response (video,
+    // multi-MB JSON, etc.) cannot balloon the connection log or pin the
+    // UI when rendering. The bytes still went to the client unchanged.
+    let response_body = cap_logged_response_body(response_body, response_buf.len());
 
     let conn = ConnectionLog {
         id: uuid::Uuid::new_v4().to_string(),
@@ -627,21 +808,73 @@ async fn serve_intercept_over_tls(
 
             let upstream_tcp =
                 tokio::net::TcpStream::connect((reroute_host.as_str(), reroute_port)).await?;
-            let response_buf = if is_https {
+            // Reroute upstreams get the same stall protection as the
+            // straight-MITM path — a hung target is a hung target.
+            let (response_buf, reroute_outcome) = if is_https {
                 let connector = tls::build_upstream_connector()?;
                 let server_name = rustls::pki_types::ServerName::try_from(reroute_host.clone())?;
                 let mut upstream_tls = connector.connect(server_name, upstream_tcp).await?;
                 upstream_tls.write_all(request_line.as_bytes()).await?;
                 let mut buf = Vec::new();
-                let _ = upstream_tls.read_to_end(&mut buf).await;
-                buf
+                let outcome = read_upstream_to_end(
+                    &mut upstream_tls,
+                    &mut buf,
+                    8 * 1024 * 1024,
+                    UPSTREAM_TOTAL_READ_TIMEOUT,
+                    UPSTREAM_IDLE_READ_TIMEOUT,
+                )
+                .await;
+                (buf, outcome)
             } else {
                 let mut s = upstream_tcp;
                 s.write_all(request_line.as_bytes()).await?;
                 let mut buf = Vec::new();
-                let _ = s.read_to_end(&mut buf).await;
-                buf
+                let outcome = read_upstream_to_end(
+                    &mut s,
+                    &mut buf,
+                    8 * 1024 * 1024,
+                    UPSTREAM_TOTAL_READ_TIMEOUT,
+                    UPSTREAM_IDLE_READ_TIMEOUT,
+                )
+                .await;
+                (buf, outcome)
             };
+
+            if reroute_outcome == UpstreamReadOutcome::TimedOut {
+                let note = format!(
+                    "Upstream read timeout after {}s (reroute to {})",
+                    UPSTREAM_TOTAL_READ_TIMEOUT.as_secs(),
+                    target_url,
+                );
+                let timeout_resp = build_gateway_timeout_response_bytes(&note);
+                let _ = tls_client.write_all(&timeout_resp).await;
+                let _ = tls_client.shutdown().await;
+                let duration_ms = start.elapsed().as_millis() as u64;
+                let conn = ConnectionLog {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    method: method.to_string(),
+                    url: url.to_string(),
+                    host: host.to_string(),
+                    path: path.to_string(),
+                    status: Some(504),
+                    duration_ms: Some(duration_ms),
+                    request_size: None,
+                    response_size: Some(timeout_resp.len() as u64),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    request_headers: request_headers.to_vec(),
+                    response_headers: vec![],
+                    request_body: request_body.clone(),
+                    response_body: Some(format!("Proxie: {}", note)),
+                    content_type: Some("text/plain; charset=utf-8".to_string()),
+                    intercepted: true,
+                    blocked: false,
+                    bookmarked: false,
+                };
+                state.add_connection(conn.clone()).await;
+                let _ = app_handle.emit("proxy:connection", &conn);
+                log::warn!("reroute {}: {}", target_url, note);
+                return Ok(());
+            }
 
             tls_client.write_all(&response_buf).await?;
             let _ = tls_client.shutdown().await;
@@ -1083,15 +1316,34 @@ async fn handle_http_request(
     // Forward the request
     upstream.write_all(request_data).await?;
 
-    // Read the response
+    // Read the response. The initial read is bounded by the idle timeout
+    // so a slow-loris upstream can't wedge us before any bytes arrive; the
+    // total wall-clock budget is enforced by `UPSTREAM_TOTAL_READ_TIMEOUT`.
+    // The legacy "100ms idle-after-headers" heuristic is preserved so
+    // keep-alive HTTP/1.1 responses don't dawdle waiting for EOF.
     let mut response_buf = Vec::new();
     let mut tmp = vec![0u8; 8192];
+    let deadline = tokio::time::Instant::now() + UPSTREAM_TOTAL_READ_TIMEOUT;
+    let mut timed_out = false;
     loop {
-        let n = upstream.read(&mut tmp).await?;
-        if n == 0 {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            timed_out = true;
             break;
         }
-        response_buf.extend_from_slice(&tmp[..n]);
+        let budget = std::cmp::min(deadline - now, UPSTREAM_IDLE_READ_TIMEOUT);
+        let read_res = tokio::time::timeout(budget, upstream.read(&mut tmp)).await;
+        match read_res {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => {
+                response_buf.extend_from_slice(&tmp[..n]);
+            }
+            Ok(Err(_)) => break,
+            Err(_) => {
+                timed_out = true;
+                break;
+            }
+        }
         if response_buf.len() > 4 && response_buf.windows(4).any(|w| w == b"\r\n\r\n") {
             match tokio::time::timeout(
                 std::time::Duration::from_millis(100),
@@ -1103,6 +1355,41 @@ async fn handle_http_request(
                 _ => break,
             }
         }
+    }
+
+    if timed_out {
+        let note = format!(
+            "Upstream read timeout after {}s ({})",
+            UPSTREAM_TOTAL_READ_TIMEOUT.as_secs(),
+            upstream_addr
+        );
+        let timeout_resp = build_gateway_timeout_response_bytes(&note);
+        let _ = client_stream.write_all(&timeout_resp).await;
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let conn = ConnectionLog {
+            id: uuid::Uuid::new_v4().to_string(),
+            method: method.to_string(),
+            url: url.to_string(),
+            host: host.to_string(),
+            path,
+            status: Some(504),
+            duration_ms: Some(duration_ms),
+            request_size: Some(request_data.len() as u64),
+            response_size: Some(timeout_resp.len() as u64),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            request_headers,
+            response_headers: vec![],
+            request_body,
+            response_body: Some(format!("Proxie: {}", note)),
+            content_type: Some("text/plain; charset=utf-8".to_string()),
+            intercepted: false,
+            blocked: false,
+            bookmarked: false,
+        };
+        state.add_connection(conn.clone()).await;
+        let _ = app_handle.emit("proxy:connection", &conn);
+        log::warn!("plain-HTTP {}: {}", upstream_addr, note);
+        return Ok(());
     }
 
     let duration_ms = start.elapsed().as_millis() as u64;
@@ -1252,15 +1539,28 @@ async fn handle_intercepted_request(
             // Send rewritten request
             upstream.write_all(request_str.as_bytes()).await?;
 
-            // Read response from rerouted target
+            // Read response from rerouted target (same idle/total-timeout
+            // contract as the no-intercept plain-HTTP forward path).
             let mut response_buf = Vec::new();
             let mut tmp = vec![0u8; 8192];
+            let deadline = tokio::time::Instant::now() + UPSTREAM_TOTAL_READ_TIMEOUT;
+            let mut timed_out = false;
             loop {
-                let n = upstream.read(&mut tmp).await?;
-                if n == 0 {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    timed_out = true;
                     break;
                 }
-                response_buf.extend_from_slice(&tmp[..n]);
+                let budget = std::cmp::min(deadline - now, UPSTREAM_IDLE_READ_TIMEOUT);
+                match tokio::time::timeout(budget, upstream.read(&mut tmp)).await {
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(n)) => response_buf.extend_from_slice(&tmp[..n]),
+                    Ok(Err(_)) => break,
+                    Err(_) => {
+                        timed_out = true;
+                        break;
+                    }
+                }
                 if response_buf.len() > 4 && response_buf.windows(4).any(|w| w == b"\r\n\r\n") {
                     match tokio::time::timeout(
                         std::time::Duration::from_millis(100),
@@ -1272,6 +1572,41 @@ async fn handle_intercepted_request(
                         _ => break,
                     }
                 }
+            }
+
+            if timed_out {
+                let note = format!(
+                    "Upstream read timeout after {}s (reroute to {})",
+                    UPSTREAM_TOTAL_READ_TIMEOUT.as_secs(),
+                    target_url
+                );
+                let timeout_resp = build_gateway_timeout_response_bytes(&note);
+                let _ = client_stream.write_all(&timeout_resp).await;
+                let duration_ms = start.elapsed().as_millis() as u64;
+                let conn = ConnectionLog {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    method: method.to_string(),
+                    url: url.to_string(),
+                    host: host.to_string(),
+                    path: path.to_string(),
+                    status: Some(504),
+                    duration_ms: Some(duration_ms),
+                    request_size: None,
+                    response_size: Some(timeout_resp.len() as u64),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    request_headers: request_headers.to_vec(),
+                    response_headers: vec![],
+                    request_body: request_body.clone(),
+                    response_body: Some(format!("Proxie: {}", note)),
+                    content_type: Some("text/plain; charset=utf-8".to_string()),
+                    intercepted: true,
+                    blocked: false,
+                    bookmarked: false,
+                };
+                state.add_connection(conn.clone()).await;
+                let _ = app_handle.emit("proxy:connection", &conn);
+                log::warn!("reroute {}: {}", target_url, note);
+                return Ok(());
             }
 
             let duration_ms = start.elapsed().as_millis() as u64;
@@ -2415,5 +2750,145 @@ mod tests {
             "unknown errors should still hint at the CA, got: {}",
             note
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Upstream-read-timeout tests (regression for tesla.com bot-probe
+    // endpoints that hold the socket without sending bytes).
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_build_gateway_timeout_response_bytes_shape() {
+        let bytes = build_gateway_timeout_response_bytes("Upstream read timeout after 60s (x.com)");
+        let s = String::from_utf8(bytes).unwrap();
+        assert!(s.starts_with("HTTP/1.1 504 Gateway Timeout\r\n"));
+        assert!(s.contains("Content-Type: text/plain; charset=utf-8"));
+        assert!(s.contains("X-Proxie-Error: upstream-read-timeout"));
+        assert!(s.contains("Upstream read timeout after 60s (x.com)"));
+        assert!(s.contains("\r\n\r\n"));
+    }
+
+    #[tokio::test]
+    async fn test_read_upstream_to_end_returns_timed_out_when_upstream_holds_socket() {
+        // Spin up a local TCP listener that accepts the connection but
+        // never writes anything — mimics tesla.com's bot-probe behaviour.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Hold the socket open and silent for longer than the test
+            // timeout — but only briefly so the test process exits fast.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let _ = sock.shutdown().await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut buf = Vec::new();
+        let outcome = read_upstream_to_end(
+            &mut client,
+            &mut buf,
+            8 * 1024 * 1024,
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        assert_eq!(outcome, UpstreamReadOutcome::TimedOut);
+        assert!(buf.is_empty(), "no bytes should have been read");
+    }
+
+    #[tokio::test]
+    async fn test_read_upstream_to_end_returns_eof_on_well_behaved_upstream() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+                .await
+                .unwrap();
+            let _ = sock.shutdown().await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut buf = Vec::new();
+        let outcome = read_upstream_to_end(
+            &mut client,
+            &mut buf,
+            8 * 1024 * 1024,
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(outcome, UpstreamReadOutcome::Eof);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(s.starts_with("HTTP/1.1 200 OK"));
+        assert!(s.ends_with("hello"));
+    }
+
+    #[tokio::test]
+    async fn test_read_upstream_to_end_respects_size_cap() {
+        // Server writes 4 KB then closes; size cap is 1 KB.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let payload = vec![b'a'; 4096];
+            let _ = sock.write_all(&payload).await;
+            let _ = sock.shutdown().await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut buf = Vec::new();
+        let outcome = read_upstream_to_end(
+            &mut client,
+            &mut buf,
+            1024,
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(outcome, UpstreamReadOutcome::SizeCapped);
+        assert!(
+            buf.len() >= 1024,
+            "buf should contain at least the cap (got {})",
+            buf.len()
+        );
+    }
+
+    #[test]
+    fn test_cap_logged_response_body_passes_small_payloads_through() {
+        let body = Some("hello".to_string());
+        let capped = cap_logged_response_body(body.clone(), 5);
+        assert_eq!(capped, body);
+    }
+
+    #[test]
+    fn test_cap_logged_response_body_replaces_oversized_payload_with_placeholder() {
+        let huge_raw_len = RESPONSE_BODY_CAPTURE_CAP + 1;
+        let capped = cap_logged_response_body(
+            Some("doesnt-matter-because-the-source-was-huge".to_string()),
+            huge_raw_len,
+        );
+        let s = capped.expect("placeholder must be present");
+        assert!(s.starts_with("<body too large;"));
+        assert!(s.contains(&huge_raw_len.to_string()));
+    }
+
+    #[test]
+    fn test_cap_logged_response_body_passes_none_through() {
+        // Binary path that already produced `None` (e.g. content too
+        // large to decode) must stay `None`.
+        let capped = cap_logged_response_body(None, RESPONSE_BODY_CAPTURE_CAP - 1);
+        assert!(capped.is_none());
+    }
+
+    #[test]
+    fn test_upstream_timeout_constants_have_sane_defaults() {
+        // Guard against accidental zero / regression to insanely large
+        // values that would defeat the whole point of the fix.
+        assert!(UPSTREAM_TOTAL_READ_TIMEOUT >= std::time::Duration::from_secs(10));
+        assert!(UPSTREAM_TOTAL_READ_TIMEOUT <= std::time::Duration::from_secs(300));
+        assert!(UPSTREAM_IDLE_READ_TIMEOUT > std::time::Duration::ZERO);
+        assert!(UPSTREAM_IDLE_READ_TIMEOUT <= UPSTREAM_TOTAL_READ_TIMEOUT);
+        assert!(RESPONSE_BODY_CAPTURE_CAP >= 1024 * 1024);
     }
 }

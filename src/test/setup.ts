@@ -7,6 +7,7 @@ import { vi } from 'vitest';
 // Keep these in sync with the declarations in `src/vite-env.d.ts`.
 (globalThis as Record<string, unknown>).__APP_VERSION__ ??= '0.0.0-test';
 (globalThis as Record<string, unknown>).__BUILD_DATE__ ??= '2026-01-01';
+(globalThis as Record<string, unknown>).__BUILD_TIME__ ??= '00:00 UTC';
 (globalThis as Record<string, unknown>).__GIT_SHA__ ??= 'testsha';
 (globalThis as Record<string, unknown>).__RELEASE_CHANNEL__ ??= 'dev';
 
