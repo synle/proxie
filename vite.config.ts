@@ -48,7 +48,9 @@ const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 
 };
 
 const APP_VERSION = pkg.version;
-const BUILD_DATE = new Date().toISOString().slice(0, 10);
+const NOW_ISO = new Date().toISOString();
+const BUILD_DATE = NOW_ISO.slice(0, 10);
+const BUILD_TIME = NOW_ISO.slice(11, 16) + ' UTC';
 const GIT_SHA = resolveGitSha();
 const RELEASE_CHANNEL = resolveReleaseChannel();
 
@@ -62,6 +64,7 @@ export default defineConfig(async () => ({
   define: {
     __APP_VERSION__: JSON.stringify(APP_VERSION),
     __BUILD_DATE__: JSON.stringify(BUILD_DATE),
+    __BUILD_TIME__: JSON.stringify(BUILD_TIME),
     __GIT_SHA__: JSON.stringify(GIT_SHA),
     __RELEASE_CHANNEL__: JSON.stringify(RELEASE_CHANNEL),
   },
