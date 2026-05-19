@@ -25,34 +25,39 @@ describe('Layout', () => {
   it('renders the dev-format AppBar title by default', () => {
     vi.stubGlobal('__APP_VERSION__', '0.1.10');
     vi.stubGlobal('__BUILD_DATE__', '2026-05-16');
+    vi.stubGlobal('__BUILD_TIME__', '14:32 UTC');
     vi.stubGlobal('__GIT_SHA__', 'deadbee');
     vi.stubGlobal('__RELEASE_CHANNEL__', 'dev');
 
     renderLayout();
 
-    expect(screen.getByText('Proxie DEV v0.1.10 2026-05-16')).toBeInTheDocument();
+    expect(screen.getByText('Proxie DEV v0.1.10 2026-05-16 14:32 UTC')).toBeInTheDocument();
   });
 
   it('renders the beta-format title with the short SHA when channel is beta', () => {
     vi.stubGlobal('__APP_VERSION__', '0.1.10');
     vi.stubGlobal('__BUILD_DATE__', '2026-05-16');
+    vi.stubGlobal('__BUILD_TIME__', '14:32 UTC');
     vi.stubGlobal('__GIT_SHA__', 'deadbee');
     vi.stubGlobal('__RELEASE_CHANNEL__', 'beta');
 
     renderLayout();
 
-    expect(screen.getByText('Proxie Beta v0.1.10 2026-05-16 deadbee')).toBeInTheDocument();
+    expect(
+      screen.getByText('Proxie Beta v0.1.10 2026-05-16 14:32 UTC deadbee'),
+    ).toBeInTheDocument();
   });
 
   it('renders the official-format title without any tag when channel is official', () => {
     vi.stubGlobal('__APP_VERSION__', '0.1.10');
     vi.stubGlobal('__BUILD_DATE__', '2026-05-16');
+    vi.stubGlobal('__BUILD_TIME__', '14:32 UTC');
     vi.stubGlobal('__GIT_SHA__', 'deadbee');
     vi.stubGlobal('__RELEASE_CHANNEL__', 'official');
 
     renderLayout();
 
-    expect(screen.getByText('Proxie v0.1.10 2026-05-16')).toBeInTheDocument();
+    expect(screen.getByText('Proxie v0.1.10 2026-05-16 14:32 UTC')).toBeInTheDocument();
   });
 
   it('renders all nav items and clicking one is non-throwing', async () => {
