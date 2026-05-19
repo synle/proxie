@@ -190,6 +190,7 @@ pub fn run() {
     env_logger::init();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let app_state = Arc::new(AppState::new(app.handle()));
             app.manage(app_state);

@@ -2,6 +2,7 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
+import { openUrl } from '@tauri-apps/plugin-opener';
 import SetupPage from './SetupPage';
 
 function makeCert(overrides: Partial<Record<string, unknown>> = {}) {
@@ -31,9 +32,12 @@ function makeConfig(overrides: Partial<Record<string, unknown>> = {}) {
 
 describe('SetupPage', () => {
   const invokeMock = invoke as unknown as ReturnType<typeof vi.fn>;
+  const openUrlMock = openUrl as unknown as ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     invokeMock.mockReset();
+    openUrlMock.mockReset();
+    openUrlMock.mockResolvedValue(undefined);
   });
 
   it('renders proxy config and the "no cert" state initially', async () => {
@@ -212,6 +216,44 @@ describe('SetupPage', () => {
     await user.click(screen.getByRole('tab', { name: /Linux/i }));
     await waitFor(() => {
       expect(screen.getByText(/update-ca-certificates/)).toBeInTheDocument();
+    });
+  });
+
+  it('clicking the proxy URL opens the /ping endpoint in the default browser', async () => {
+    const user = userEvent.setup();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_cert_info') return null;
+      if (cmd === 'get_proxy_config') return makeConfig();
+      return undefined;
+    });
+
+    render(<SetupPage />);
+    await waitFor(() => expect(screen.getByText(/127\.0\.0\.1:39871/)).toBeInTheDocument());
+
+    const link = screen.getByRole('button', { name: /127\.0\.0\.1:39871/ });
+    await user.click(link);
+
+    await waitFor(() => {
+      expect(openUrlMock).toHaveBeenCalledWith('http://127.0.0.1:39871/ping');
+    });
+  });
+
+  it('surfaces an error alert when opening the proxy URL fails', async () => {
+    const user = userEvent.setup();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_cert_info') return null;
+      if (cmd === 'get_proxy_config') return makeConfig();
+      return undefined;
+    });
+    openUrlMock.mockRejectedValueOnce(new Error('opener missing'));
+
+    render(<SetupPage />);
+    await waitFor(() => expect(screen.getByText(/127\.0\.0\.1:39871/)).toBeInTheDocument());
+
+    await user.click(screen.getByRole('button', { name: /127\.0\.0\.1:39871/ }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert').textContent).toMatch(/Error: .*opener missing/);
     });
   });
 

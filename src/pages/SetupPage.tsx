@@ -11,8 +11,10 @@ import {
   Tab,
   Divider,
   Chip,
+  Link,
 } from '@mui/material';
 import { invoke } from '@tauri-apps/api/core';
+import { openUrl } from '@tauri-apps/plugin-opener';
 
 interface PlatformInstructions {
   macos: string;
@@ -79,6 +81,24 @@ export default function SetupPage() {
     }
   };
 
+  /**
+   * Open the proxy's self-served `/ping` endpoint in the user's default
+   * browser via the Tauri opener plugin.
+   *
+   * The Rust proxy short-circuits any `GET <listen_addr>:<port>/ping`
+   * request and replies with a small JSON status blob, giving the user a
+   * one-click way to confirm Proxie is actually listening on the address
+   * shown on this page.
+   */
+  const handleOpenPing = async () => {
+    const url = `http://${config.listen_addr}:${config.port}/ping`;
+    try {
+      await openUrl(url);
+    } catch (e) {
+      setStatus(`Error: ${e}`);
+    }
+  };
+
   const platformLabels = ['macOS', 'Windows', 'Linux (Ubuntu)'];
   const platformKeys: (keyof PlatformInstructions)[] = ['macos', 'windows', 'linux'];
 
@@ -120,9 +140,14 @@ export default function SetupPage() {
           </Box>
           <Typography variant='body2' color='text.secondary' sx={{ mb: 2 }}>
             Configure your system or browser to use HTTP proxy at{' '}
-            <strong>
+            <Link
+              component='button'
+              type='button'
+              onClick={handleOpenPing}
+              sx={{ fontWeight: 'bold', verticalAlign: 'baseline' }}
+              title='Open /ping in your default browser to verify the proxy is reachable'>
               {config.listen_addr}:{config.port}
-            </strong>
+            </Link>
           </Typography>
           <Button variant='contained' onClick={handleSaveConfig}>
             Save Configuration
