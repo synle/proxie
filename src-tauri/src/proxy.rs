@@ -1245,6 +1245,38 @@ async fn handle_http_request(
     let host = extract_host(url, &request_str);
     let path = extract_path(url);
 
+    // Self-served `/ping` endpoint — short-circuit any request whose Host
+    // header equals the proxy's own listen addr AND whose path starts with
+    // `/ping`. Lets users click the address chip on the Setup page and see
+    // an immediate "yes, the proxy is up" response.
+    //
+    // Intentionally NOT recorded in the connection log — this is a meta
+    // request to the proxy itself, not user traffic, and logging it would
+    // fill the Connections view with noise every time the user clicks the
+    // address link.
+    if path == "/ping" || path.starts_with("/ping?") || path.starts_with("/ping/") {
+        // Pull addr/port out of the `Result` and drop the non-Send boxed
+        // error before the next `.await` — tokio::spawn requires the future
+        // to be `Send` and `Box<dyn StdError>` is not.
+        let listen = match state.get_proxy_config().await {
+            Ok(cfg) => Some((cfg.listen_addr, cfg.port)),
+            Err(_) => None,
+        };
+        if let Some((listen_addr, port)) = listen {
+            if host_header_matches_listen(&request_str, &listen_addr, port) {
+                let body = build_ping_response_body(&listen_addr, port);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                client_stream.write_all(resp.as_bytes()).await?;
+                let _ = (app_handle, start); // intentionally not logged
+                return Ok(());
+            }
+        }
+    }
+
     // Extract request body (everything after \r\n\r\n)
     let request_body = request_str
         .find("\r\n\r\n")
@@ -1652,6 +1684,59 @@ pub fn host_matches(pattern: &str, host: &str) -> bool {
     } else {
         pattern == host
     }
+}
+
+/// Build the JSON body returned by the self-served `/ping` endpoint.
+///
+/// Shape: `{"proxy":"proxie","version":"<pkg>","status":"ok","listen":"<addr>:<port>"}`.
+/// Kept tiny on purpose — the click target is a "is the proxy up?" probe,
+/// not a metrics endpoint.
+///
+/// # Arguments
+/// * `listen_addr` - The proxy's bound address (typically `127.0.0.1`).
+/// * `port` - The proxy's bound port.
+///
+/// # Returns
+/// A JSON string with no trailing newline.
+pub(crate) fn build_ping_response_body(listen_addr: &str, port: u16) -> String {
+    let body = serde_json::json!({
+        "proxy": "proxie",
+        "version": env!("CARGO_PKG_VERSION"),
+        "status": "ok",
+        "listen": format!("{}:{}", listen_addr, port),
+    });
+    body.to_string()
+}
+
+/// Check whether the `Host:` header of a raw HTTP request points at the
+/// proxy's own listen address.
+///
+/// Accepts either the bare host (`127.0.0.1`) or the host+port form
+/// (`127.0.0.1:39871`). Header-name match is case-insensitive; value
+/// comparison is exact after trimming.
+///
+/// # Arguments
+/// * `request` - The raw HTTP/1.1 request bytes as a UTF-8 lossy string.
+/// * `listen_addr` - The proxy's bound address.
+/// * `port` - The proxy's bound port.
+///
+/// # Returns
+/// `true` when the Host header explicitly matches `<listen_addr>` or
+/// `<listen_addr>:<port>`; `false` otherwise (including when no Host header
+/// is present).
+fn host_header_matches_listen(request: &str, listen_addr: &str, port: u16) -> bool {
+    for line in request.lines() {
+        let lower = line.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("host:") {
+            let v = rest.trim();
+            let expected_bare = listen_addr.to_ascii_lowercase();
+            let expected_full = format!("{}:{}", expected_bare, port);
+            if v == expected_bare || v == expected_full {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn extract_host(url: &str, request: &str) -> String {
@@ -2736,6 +2821,37 @@ mod tests {
             note
         );
     }
+
+    #[test]
+    fn test_build_ping_response_body_shape() {
+        // `/ping` reply is a tiny JSON status blob. Assert all four keys
+        // are present, well-formed, and carry the expected values so the
+        // contract stays stable for any future client (curl, browser, k6).
+        let body = build_ping_response_body("127.0.0.1", 39871);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["proxy"], "proxie");
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["listen"], "127.0.0.1:39871");
+        // Version must be a non-empty string sourced from CARGO_PKG_VERSION.
+        let version = v["version"].as_str().expect("version is a string");
+        assert!(!version.is_empty(), "version should be non-empty");
+        assert_eq!(version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn test_host_header_matches_listen_bare_and_full() {
+        let req_bare = "GET /ping HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+        let req_full = "GET /ping HTTP/1.1\r\nHost: 127.0.0.1:39871\r\n\r\n";
+        let req_other = "GET /ping HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let req_none = "GET /ping HTTP/1.1\r\n\r\n";
+        assert!(host_header_matches_listen(req_bare, "127.0.0.1", 39871));
+        assert!(host_header_matches_listen(req_full, "127.0.0.1", 39871));
+        assert!(!host_header_matches_listen(req_other, "127.0.0.1", 39871));
+        assert!(!host_header_matches_listen(req_none, "127.0.0.1", 39871));
+        // Wrong port on the Host header must NOT match.
+        assert!(!host_header_matches_listen(req_full, "127.0.0.1", 1234));
+    }
+
 
     // ---------------------------------------------------------------
     // Upstream-read-timeout tests (regression for tesla.com bot-probe

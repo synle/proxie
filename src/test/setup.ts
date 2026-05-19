@@ -28,6 +28,12 @@ vi.mock('@tauri-apps/api/event', () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }));
 
+// Mock @tauri-apps/plugin-opener
+vi.mock('@tauri-apps/plugin-opener', () => ({
+  openUrl: vi.fn().mockResolvedValue(undefined),
+  openPath: vi.fn().mockResolvedValue(undefined),
+}));
+
 // Mock @tauri-apps/api/window
 vi.mock('@tauri-apps/api/window', () => ({
   getCurrentWindow: () => ({

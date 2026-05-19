@@ -2,7 +2,14 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
+<<<<<<< HEAD
+import { openUrl } from '@tauri-apps/plugin-opener';
+import SetupPage from './SetupPage';
+||||||| b3f5f7d
+import SetupPage from './SetupPage';
+=======
 import SetupPage, { makeExportFilename } from './SetupPage';
+>>>>>>> origin/main
 
 function makeCert(overrides: Partial<Record<string, unknown>> = {}) {
   return {
@@ -55,9 +62,12 @@ function makeInvokeMock(opts: {
 
 describe('SetupPage', () => {
   const invokeMock = invoke as unknown as ReturnType<typeof vi.fn>;
+  const openUrlMock = openUrl as unknown as ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     invokeMock.mockReset();
+    openUrlMock.mockReset();
+    openUrlMock.mockResolvedValue(undefined);
   });
 
   it('renders proxy config and the "no cert" state initially', async () => {
@@ -231,6 +241,44 @@ describe('SetupPage', () => {
     });
   });
 
+<<<<<<< HEAD
+  it('clicking the proxy URL opens the /ping endpoint in the default browser', async () => {
+    const user = userEvent.setup();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_cert_info') return null;
+      if (cmd === 'get_proxy_config') return makeConfig();
+      return undefined;
+    });
+
+    render(<SetupPage />);
+    await waitFor(() => expect(screen.getByText(/127\.0\.0\.1:39871/)).toBeInTheDocument());
+
+    const link = screen.getByRole('button', { name: /127\.0\.0\.1:39871/ });
+    await user.click(link);
+
+    await waitFor(() => {
+      expect(openUrlMock).toHaveBeenCalledWith('http://127.0.0.1:39871/ping');
+    });
+  });
+
+  it('surfaces an error alert when opening the proxy URL fails', async () => {
+    const user = userEvent.setup();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_cert_info') return null;
+      if (cmd === 'get_proxy_config') return makeConfig();
+      return undefined;
+    });
+    openUrlMock.mockRejectedValueOnce(new Error('opener missing'));
+
+    render(<SetupPage />);
+    await waitFor(() => expect(screen.getByText(/127\.0\.0\.1:39871/)).toBeInTheDocument());
+
+    await user.click(screen.getByRole('button', { name: /127\.0\.0\.1:39871/ }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert').textContent).toMatch(/Error: .*opener missing/);
+||||||| b3f5f7d
+=======
   it('makeExportFilename produces a YYYY-MM-DD suffix', () => {
     const name = makeExportFilename(new Date(2026, 4, 18)); // May 18, 2026
     expect(name).toBe('proxie-2026-05-18.json');
@@ -447,6 +495,7 @@ describe('SetupPage', () => {
 
     await waitFor(() => {
       expect(screen.getByRole('alert').textContent).toMatch(/Error: .*invalid JSON/);
+>>>>>>> origin/main
     });
   });
 

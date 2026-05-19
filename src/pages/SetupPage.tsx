@@ -11,6 +11,10 @@ import {
   Tab,
   Divider,
   Chip,
+<<<<<<< HEAD
+  Link,
+||||||| b3f5f7d
+=======
   Dialog,
   DialogTitle,
   DialogContent,
@@ -21,6 +25,7 @@ import {
   FormControlLabel,
   FormLabel,
   Snackbar,
+>>>>>>> origin/main
   Accordion,
   AccordionSummary,
   AccordionDetails,
@@ -28,6 +33,7 @@ import {
 } from '@mui/material';
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 import { invoke } from '@tauri-apps/api/core';
+import { openUrl } from '@tauri-apps/plugin-opener';
 
 interface ImportSummary {
   host_rules_added: number;
@@ -209,6 +215,24 @@ export default function SetupPage() {
   };
 
   /**
+<<<<<<< HEAD
+   * Open the proxy's self-served `/ping` endpoint in the user's default
+   * browser via the Tauri opener plugin.
+   *
+   * The Rust proxy short-circuits any `GET <listen_addr>:<port>/ping`
+   * request and replies with a small JSON status blob, giving the user a
+   * one-click way to confirm Proxie is actually listening on the address
+   * shown on this page.
+   */
+  const handleOpenPing = async () => {
+    const url = `http://${config.listen_addr}:${config.port}/ping`;
+    try {
+      await openUrl(url);
+    } catch (e) {
+      setStatus(`Error: ${e}`);
+    }
+||||||| b3f5f7d
+=======
    * Pull the user's rule config from the backend as pretty JSON, then push
    * it through the webview download pipeline as `proxie-YYYY-MM-DD.json`.
    */
@@ -263,6 +287,7 @@ export default function SetupPage() {
 
   const handleImportClick = () => {
     fileInputRef.current?.click();
+>>>>>>> origin/main
   };
 
   const platformLabels = ['macOS', 'Windows', 'Linux (Ubuntu)'];
@@ -309,9 +334,14 @@ export default function SetupPage() {
           </Box>
           <Typography variant='body2' color='text.secondary' sx={{ mb: 2 }}>
             Configure your system or browser to use HTTP proxy at{' '}
-            <strong>
+            <Link
+              component='button'
+              type='button'
+              onClick={handleOpenPing}
+              sx={{ fontWeight: 'bold', verticalAlign: 'baseline' }}
+              title='Open /ping in your default browser to verify the proxy is reachable'>
               {config.listen_addr}:{config.port}
-            </strong>
+            </Link>
           </Typography>
           <Button variant='contained' onClick={handleSaveConfig}>
             Save Configuration
