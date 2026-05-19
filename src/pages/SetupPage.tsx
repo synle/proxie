@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Box,
   Button,
@@ -11,8 +11,63 @@ import {
   Tab,
   Divider,
   Chip,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  Radio,
+  RadioGroup,
+  FormControl,
+  FormControlLabel,
+  FormLabel,
+  Snackbar,
+  Stack,
 } from '@mui/material';
 import { invoke } from '@tauri-apps/api/core';
+
+interface ImportSummary {
+  host_rules_added: number;
+  intercept_rules_added: number;
+  block_rules_added: number;
+}
+
+type ImportMode = 'replace' | 'merge';
+
+/**
+ * Build a `proxie-YYYY-MM-DD.json` filename for the export download.
+ *
+ * @param now - Optional `Date` injection point for tests.
+ * @returns Filename string with an ISO date suffix.
+ */
+export function makeExportFilename(now: Date = new Date()): string {
+  const yyyy = now.getFullYear();
+  const mm = String(now.getMonth() + 1).padStart(2, '0');
+  const dd = String(now.getDate()).padStart(2, '0');
+  return `proxie-${yyyy}-${mm}-${dd}.json`;
+}
+
+/**
+ * Trigger a browser download for a UTF-8 string. Works inside the Tauri
+ * webview because Tauri exposes the standard DOM `Blob` + anchor download
+ * pipeline. Reused from the Connections page Save flow.
+ *
+ * @param text - File contents.
+ * @param filename - Suggested filename.
+ */
+function downloadJson(text: string, filename: string) {
+  const blob = new Blob([text], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  try {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
 
 interface PlatformInstructions {
   macos: string;
@@ -44,6 +99,13 @@ export default function SetupPage() {
   });
   const [platformTab, setPlatformTab] = useState(0);
   const [status, setStatus] = useState<string | null>(null);
+  // Import flow state. `pendingImport` holds the file contents while the
+  // user picks a mode in the modal dialog (rule 22 — confirm intent before
+  // any destructive action).
+  const [pendingImport, setPendingImport] = useState<string | null>(null);
+  const [importMode, setImportMode] = useState<ImportMode>('merge');
+  const [snackbar, setSnackbar] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     loadData();
@@ -77,6 +139,63 @@ export default function SetupPage() {
     } catch (e) {
       setStatus(`Error: ${e}`);
     }
+  };
+
+  /**
+   * Pull the user's rule config from the backend as pretty JSON, then push
+   * it through the webview download pipeline as `proxie-YYYY-MM-DD.json`.
+   */
+  const handleExportConfig = async () => {
+    try {
+      const json = await invoke<string>('export_config');
+      downloadJson(json, makeExportFilename());
+      setStatus('Configuration exported');
+    } catch (e) {
+      setStatus(`Error: ${e}`);
+    }
+  };
+
+  /**
+   * Read a user-picked file as text and stash it in `pendingImport` so the
+   * mode-selection dialog can finish the flow on confirm.
+   */
+  const handleFilePicked = async (file: File | null) => {
+    if (!file) return;
+    try {
+      const text = await file.text();
+      setPendingImport(text);
+    } catch (e) {
+      setStatus(`Error: ${e}`);
+    }
+  };
+
+  /**
+   * Send the pending import payload to the backend with the chosen mode.
+   * On success, reflect the per-list counts in a snackbar; on error, route
+   * through the existing alert banner.
+   */
+  const handleConfirmImport = async () => {
+    if (!pendingImport) return;
+    const payload = pendingImport;
+    const mode = importMode;
+    setPendingImport(null);
+    try {
+      const summary = await invoke<ImportSummary>('import_config', {
+        json: payload,
+        mode,
+      });
+      setSnackbar(
+        `Imported: ${summary.host_rules_added} host, ` +
+          `${summary.intercept_rules_added} intercept, ` +
+          `${summary.block_rules_added} block rules`,
+      );
+    } catch (e) {
+      setStatus(`Error: ${e}`);
+    }
+  };
+
+  const handleImportClick = () => {
+    fileInputRef.current?.click();
   };
 
   const platformLabels = ['macOS', 'Windows', 'Linux (Ubuntu)'];
@@ -129,6 +248,85 @@ export default function SetupPage() {
           </Button>
         </CardContent>
       </Card>
+
+      {/* Configuration (export / import) — added v0.4.4 */}
+      <Card sx={{ mb: 3 }}>
+        <CardContent>
+          <Typography variant='h6' gutterBottom>
+            Configuration
+          </Typography>
+          <Typography variant='body2' color='text.secondary' sx={{ mb: 2 }}>
+            Back up or share your host, intercept, and block rules. Drop an
+            exported <code>proxie.json</code> into the config directory to
+            auto-load it on next startup.
+          </Typography>
+          <Stack direction='row' spacing={2}>
+            <Button variant='contained' onClick={handleExportConfig}>
+              Export Config
+            </Button>
+            <Button variant='outlined' onClick={handleImportClick}>
+              Import Config
+            </Button>
+            <input
+              ref={fileInputRef}
+              type='file'
+              accept='.json,application/json'
+              data-testid='import-config-file'
+              style={{ display: 'none' }}
+              onChange={(e) => {
+                const file = e.target.files?.[0] ?? null;
+                handleFilePicked(file);
+                // Reset so picking the same file twice still fires onChange.
+                e.target.value = '';
+              }}
+            />
+          </Stack>
+        </CardContent>
+      </Card>
+
+      {/* Import mode selection dialog */}
+      <Dialog
+        open={pendingImport !== null}
+        onClose={() => setPendingImport(null)}
+        aria-labelledby='import-mode-dialog-title'>
+        <DialogTitle id='import-mode-dialog-title'>Import Configuration</DialogTitle>
+        <DialogContent>
+          <Typography variant='body2' sx={{ mb: 2 }}>
+            Choose how to apply the imported rules:
+          </Typography>
+          <FormControl>
+            <FormLabel id='import-mode-label'>Mode</FormLabel>
+            <RadioGroup
+              aria-labelledby='import-mode-label'
+              value={importMode}
+              onChange={(e) => setImportMode(e.target.value as ImportMode)}>
+              <FormControlLabel
+                value='merge'
+                control={<Radio />}
+                label='Merge — append new rules, skip duplicates by id'
+              />
+              <FormControlLabel
+                value='replace'
+                control={<Radio />}
+                label='Replace — wipe existing rules and use the import as-is'
+              />
+            </RadioGroup>
+          </FormControl>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setPendingImport(null)}>Cancel</Button>
+          <Button variant='contained' onClick={handleConfirmImport}>
+            Import
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Snackbar
+        open={snackbar !== null}
+        autoHideDuration={6000}
+        onClose={() => setSnackbar(null)}
+        message={snackbar ?? ''}
+      />
 
       {/* SSL Certificate */}
       <Card sx={{ mb: 3 }}>
