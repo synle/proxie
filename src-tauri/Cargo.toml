@@ -1,6 +1,6 @@
 [package]
 name = "proxie"
-version = "0.4.3"
+version = "0.5.0"
 description = "A lightweight HTTPS proxy interceptor"
 authors = ["Sy Le"]
 edition = "2021"
