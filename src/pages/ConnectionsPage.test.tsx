@@ -345,7 +345,7 @@ describe('ConnectionsPage — column filters', () => {
     invokeMock.mockReset();
   });
 
-  it('filters rows by URL-contains in the column header', async () => {
+  it('filters rows by URL-contains via the multi-clause URL filter modal', async () => {
     const user = userEvent.setup();
     const rows = [
       makeConn({ id: 'cf-1', url: 'https://api.alpha.com/x' }),
@@ -362,13 +362,152 @@ describe('ConnectionsPage — column filters', () => {
       expect(screen.getByText('https://api.beta.com/y')).toBeInTheDocument();
     });
 
-    const urlFilter = within(screen.getByTestId('url-filter')).getByRole('textbox');
-    await user.type(urlFilter, 'beta');
+    // Trigger button shows "any" when no clauses are configured.
+    const trigger = screen.getByTestId('url-filter-button');
+    expect(trigger).toHaveTextContent(/any/i);
+    await user.click(trigger);
+
+    // First clause row should already exist after Add.
+    await user.click(screen.getByTestId('url-filter-add-clause'));
+    const valueInput = within(screen.getByTestId('url-filter-clause-0')).getByTestId(
+      'url-filter-clause-value',
+    );
+    await user.type(valueInput, 'beta');
+    await user.click(screen.getByTestId('url-filter-save'));
 
     await waitFor(() => {
       expect(screen.queryByText('https://api.alpha.com/x')).toBeNull();
       expect(screen.getByText('https://api.beta.com/y')).toBeInTheDocument();
     });
+    // Trigger button now reflects active count.
+    expect(screen.getByTestId('url-filter-button')).toHaveTextContent(/1 filter/i);
+  });
+
+  it('combines two URL clauses with OR (default) and shows count badge on trigger', async () => {
+    const user = userEvent.setup();
+    const rows = [
+      makeConn({ id: 'or-1', url: 'https://api.foo.com/x' }),
+      makeConn({ id: 'or-2', url: 'https://api.example.com/bar' }),
+      makeConn({ id: 'or-3', url: 'https://nope.example.com/y' }),
+    ];
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return rows;
+      return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() => {
+      expect(screen.getByText('https://api.foo.com/x')).toBeInTheDocument();
+      expect(screen.getByText('https://api.example.com/bar')).toBeInTheDocument();
+      expect(screen.getByText('https://nope.example.com/y')).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByTestId('url-filter-button'));
+    // Add first clause: contains 'foo'.
+    await user.click(screen.getByTestId('url-filter-add-clause'));
+    const v0 = within(screen.getByTestId('url-filter-clause-0')).getByTestId(
+      'url-filter-clause-value',
+    );
+    await user.type(v0, 'foo');
+    // Add second clause: startsWith 'https://api'.
+    await user.click(screen.getByTestId('url-filter-add-clause'));
+    const row1 = screen.getByTestId('url-filter-clause-1');
+    await user.click(within(row1).getByRole('combobox'));
+    await user.click(await screen.findByRole('option', { name: /begins with/i }));
+    const v1 = within(row1).getByTestId('url-filter-clause-value');
+    await user.type(v1, 'https://api');
+
+    // Confirm OR is the default top-level combinator.
+    const orBtn = screen.getByTestId('url-filter-combinator-OR');
+    expect(orBtn).toHaveAttribute('aria-pressed', 'true');
+
+    await user.click(screen.getByTestId('url-filter-save'));
+
+    await waitFor(() => {
+      expect(screen.getByText('https://api.foo.com/x')).toBeInTheDocument();
+      expect(screen.getByText('https://api.example.com/bar')).toBeInTheDocument();
+      expect(screen.queryByText('https://nope.example.com/y')).toBeNull();
+    });
+
+    expect(screen.getByTestId('url-filter-button')).toHaveTextContent(/2 filter/i);
+  });
+
+  it('switches combinator to AND — only rows matching every clause appear', async () => {
+    const user = userEvent.setup();
+    const rows = [
+      // Matches "foo" contains AND startsWith "https://api".
+      makeConn({ id: 'and-1', url: 'https://api.foo.com/x' }),
+      // Matches contains "foo" only.
+      makeConn({ id: 'and-2', url: 'https://other.com/foo' }),
+      // Matches startsWith "https://api" only.
+      makeConn({ id: 'and-3', url: 'https://api.example.com/bar' }),
+    ];
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return rows;
+      return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() => {
+      expect(screen.getByText('https://api.foo.com/x')).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByTestId('url-filter-button'));
+    await user.click(screen.getByTestId('url-filter-add-clause'));
+    const v0 = within(screen.getByTestId('url-filter-clause-0')).getByTestId(
+      'url-filter-clause-value',
+    );
+    await user.type(v0, 'foo');
+    await user.click(screen.getByTestId('url-filter-add-clause'));
+    const row1 = screen.getByTestId('url-filter-clause-1');
+    await user.click(within(row1).getByRole('combobox'));
+    await user.click(await screen.findByRole('option', { name: /begins with/i }));
+    await user.type(within(row1).getByTestId('url-filter-clause-value'), 'https://api');
+
+    await user.click(screen.getByTestId('url-filter-combinator-AND'));
+    await user.click(screen.getByTestId('url-filter-save'));
+
+    await waitFor(() => {
+      expect(screen.getByText('https://api.foo.com/x')).toBeInTheDocument();
+      expect(screen.queryByText('https://other.com/foo')).toBeNull();
+      expect(screen.queryByText('https://api.example.com/bar')).toBeNull();
+    });
+  });
+
+  it('adding then removing a clause leaves an empty list — no URL filter applied', async () => {
+    const user = userEvent.setup();
+    const rows = [
+      makeConn({ id: 'rm-1', url: 'https://api.alpha.com/x' }),
+      makeConn({ id: 'rm-2', url: 'https://api.beta.com/y' }),
+    ];
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return rows;
+      return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() => {
+      expect(screen.getByText('https://api.alpha.com/x')).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByTestId('url-filter-button'));
+    await user.click(screen.getByTestId('url-filter-add-clause'));
+    await user.type(
+      within(screen.getByTestId('url-filter-clause-0')).getByTestId('url-filter-clause-value'),
+      'beta',
+    );
+    // Remove the only clause.
+    await user.click(
+      within(screen.getByTestId('url-filter-clause-0')).getByTestId('url-filter-clause-remove'),
+    );
+    await user.click(screen.getByTestId('url-filter-save'));
+
+    // Both rows remain visible — empty clause list means no URL filter.
+    await waitFor(() => {
+      expect(screen.getByText('https://api.alpha.com/x')).toBeInTheDocument();
+      expect(screen.getByText('https://api.beta.com/y')).toBeInTheDocument();
+    });
+    expect(screen.getByTestId('url-filter-button')).toHaveTextContent(/any/i);
   });
 
   it('filters rows by duration with the >= operator', async () => {
