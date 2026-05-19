@@ -1138,6 +1138,21 @@ function BodyPreview({
     );
   }
 
+  // Suppress `<pre>` for opaque binary payloads even when the body wasn't
+  // encoded as a `data:` URI — `application/octet-stream` bytes are typically
+  // compressed / encrypted noise and render as garbled text.
+  if (decoded.mime.toLowerCase().startsWith('application/octet-stream')) {
+    return (
+      <Typography
+        data-testid='body-preview-binary-placeholder'
+        variant='caption'
+        color='text.secondary'>
+        Binary content — {decoded.mime} ({formatBytes(decoded.byteLength)}). Use "Save" to
+        download.
+      </Typography>
+    );
+  }
+
   return (
     <pre
       data-testid='body-preview-text'

@@ -252,6 +252,33 @@ describe('ConnectionsPage — body preview', () => {
     expect(placeholder).toHaveTextContent('application/octet-stream');
   });
 
+  it('skips <pre> rendering for application/octet-stream bodies even without a data: URI', async () => {
+    const row = makeConn({
+      id: 'preview-octet',
+      content_type: 'application/octet-stream',
+      response_headers: [['Content-Type', 'application/octet-stream']] as [string, string][],
+      // Raw garbled bytes — backend didn't base64-encode this one.
+      response_body: '\x00\x01\x02garbled\x7fbinary\x80data',
+    });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return [row];
+      return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() =>
+      expect(screen.getByText('https://api.example.com/foo')).toBeInTheDocument(),
+    );
+    await userEvent.click(screen.getByText('https://api.example.com/foo'));
+
+    const placeholder = await screen.findByTestId('body-preview-binary-placeholder');
+    expect(placeholder).toHaveTextContent(/Binary content/i);
+    expect(placeholder).toHaveTextContent('application/octet-stream');
+    // The garbled body must NOT be rendered as text.
+    expect(screen.queryByTestId('body-preview-text')).toBeNull();
+    expect(screen.queryByText(/garbled/)).toBeNull();
+  });
+
   it('renders text bodies in a <pre> block', async () => {
     const row = makeConn({
       id: 'preview-3',
