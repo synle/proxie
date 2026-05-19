@@ -145,6 +145,8 @@ The request should appear in the **Connections** page. If `curl` fails with a TL
 | **Block Rules** | Pi-hole style blocker — short-circuit ad/tracker hosts at the proxy (204/403 + no upstream socket) |
 | **Setup** | Proxy config (port, address) and SSL certificate management |
 
+Full end-user documentation for every tab lives in [`docs/README.md`](docs/README.md).
+
 ## Block Rules
 
 Block rules turn Proxie into a Charles + Pi-hole hybrid. Unlike DNS-level blockers, block rules see the actual HTTP host + path (after TLS termination for HTTPS), so you can scope blocks more precisely than NXDOMAIN allows.
