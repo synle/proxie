@@ -2,8 +2,14 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
+<<<<<<< HEAD
 import { openUrl } from '@tauri-apps/plugin-opener';
 import SetupPage from './SetupPage';
+||||||| b3f5f7d
+import SetupPage from './SetupPage';
+=======
+import SetupPage, { makeExportFilename } from './SetupPage';
+>>>>>>> origin/main
 
 function makeCert(overrides: Partial<Record<string, unknown>> = {}) {
   return {
@@ -235,6 +241,7 @@ describe('SetupPage', () => {
     });
   });
 
+<<<<<<< HEAD
   it('clicking the proxy URL opens the /ping endpoint in the default browser', async () => {
     const user = userEvent.setup();
     invokeMock.mockImplementation(async (cmd: string) => {
@@ -270,6 +277,225 @@ describe('SetupPage', () => {
 
     await waitFor(() => {
       expect(screen.getByRole('alert').textContent).toMatch(/Error: .*opener missing/);
+||||||| b3f5f7d
+=======
+  it('makeExportFilename produces a YYYY-MM-DD suffix', () => {
+    const name = makeExportFilename(new Date(2026, 4, 18)); // May 18, 2026
+    expect(name).toBe('proxie-2026-05-18.json');
+  });
+
+  it('Export Config invokes export_config and creates a JSON blob download', async () => {
+    const user = userEvent.setup();
+    const jsonPayload = JSON.stringify({
+      version: '0.0.0-test',
+      exported_at: '2026-05-18T00:00:00Z',
+      host_rules: [],
+      intercept_rules: [],
+      block_rules: [],
+    });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_cert_info') return null;
+      if (cmd === 'get_proxy_config') return makeConfig();
+      if (cmd === 'export_config') return jsonPayload;
+      return undefined;
+    });
+
+    // Spy on Blob construction and URL.createObjectURL so we can assert
+    // the download pipeline was driven with the JSON payload.
+    const blobs: Blob[] = [];
+    const origBlob = global.Blob;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (global as any).Blob = class TestBlob extends origBlob {
+      constructor(parts: BlobPart[], opts?: BlobPropertyBag) {
+        super(parts, opts);
+        blobs.push(this);
+      }
+    };
+    const createUrl = vi
+      .spyOn(URL, 'createObjectURL')
+      .mockReturnValue('blob:mock-url');
+    const revokeUrl = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
+
+    render(<SetupPage />);
+    await waitFor(() =>
+      expect(screen.getByText(/No CA certificate found/i)).toBeInTheDocument(),
+    );
+
+    await user.click(screen.getByRole('button', { name: /Export Config/i }));
+
+    await waitFor(() => {
+      expect(blobs.length).toBeGreaterThan(0);
+      expect(createUrl).toHaveBeenCalled();
+    });
+    // Read the constructed blob back as text to confirm the payload.
+    const text = await blobs[0].text();
+    expect(text).toBe(jsonPayload);
+    expect(blobs[0].type).toBe('application/json');
+    expect(screen.getByText('Configuration exported')).toBeInTheDocument();
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (global as any).Blob = origBlob;
+    createUrl.mockRestore();
+    revokeUrl.mockRestore();
+  });
+
+  it('Export Config shows an error alert when export_config rejects', async () => {
+    const user = userEvent.setup();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_cert_info') return null;
+      if (cmd === 'get_proxy_config') return makeConfig();
+      if (cmd === 'export_config') throw new Error('export boom');
+      return undefined;
+    });
+
+    render(<SetupPage />);
+    await waitFor(() =>
+      expect(screen.getByText(/No CA certificate found/i)).toBeInTheDocument(),
+    );
+
+    await user.click(screen.getByRole('button', { name: /Export Config/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert').textContent).toMatch(/Error: .*export boom/);
+    });
+  });
+
+  it('Import Config: selecting a file then choosing Merge invokes import_config with mode=merge', async () => {
+    const user = userEvent.setup();
+    let captured: Record<string, unknown> | null = null;
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === 'get_cert_info') return null;
+      if (cmd === 'get_proxy_config') return makeConfig();
+      if (cmd === 'import_config') {
+        captured = args ?? null;
+        return {
+          host_rules_added: 2,
+          intercept_rules_added: 1,
+          block_rules_added: 0,
+        };
+      }
+      return undefined;
+    });
+
+    render(<SetupPage />);
+    await waitFor(() =>
+      expect(screen.getByText(/No CA certificate found/i)).toBeInTheDocument(),
+    );
+
+    // Simulate the user picking a file. The hidden <input type=file>
+    // carries data-testid="import-config-file".
+    const fileInput = screen.getByTestId('import-config-file') as HTMLInputElement;
+    const payload = JSON.stringify({
+      version: '0.0.0-test',
+      exported_at: '2026-05-18T00:00:00Z',
+      host_rules: [{ id: 'h1', host: 'a.com', enabled: true, ignore_paths: [] }],
+      intercept_rules: [],
+      block_rules: [],
+    });
+    const file = new File([payload], 'proxie.json', { type: 'application/json' });
+    await user.upload(fileInput, file);
+
+    // Dialog opens; default mode is merge — confirm with Import.
+    expect(await screen.findByRole('dialog')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /^Import$/i }));
+
+    await waitFor(() => {
+      expect(captured).not.toBeNull();
+    });
+    expect(captured).toMatchObject({ json: payload, mode: 'merge' });
+    // Snackbar reflects the per-list import summary.
+    await waitFor(() => {
+      expect(screen.getByText(/2 host.*1 intercept.*0 block rules/)).toBeInTheDocument();
+    });
+  });
+
+  it('Import Config: switching to Replace mode forwards mode=replace', async () => {
+    const user = userEvent.setup();
+    let captured: Record<string, unknown> | null = null;
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === 'get_cert_info') return null;
+      if (cmd === 'get_proxy_config') return makeConfig();
+      if (cmd === 'import_config') {
+        captured = args ?? null;
+        return { host_rules_added: 0, intercept_rules_added: 0, block_rules_added: 0 };
+      }
+      return undefined;
+    });
+
+    render(<SetupPage />);
+    await waitFor(() =>
+      expect(screen.getByText(/No CA certificate found/i)).toBeInTheDocument(),
+    );
+
+    const fileInput = screen.getByTestId('import-config-file') as HTMLInputElement;
+    const file = new File(['{}'], 'proxie.json', { type: 'application/json' });
+    await user.upload(fileInput, file);
+
+    expect(await screen.findByRole('dialog')).toBeInTheDocument();
+    await user.click(screen.getByRole('radio', { name: /Replace/i }));
+    await user.click(screen.getByRole('button', { name: /^Import$/i }));
+
+    await waitFor(() => {
+      expect(captured).not.toBeNull();
+    });
+    expect(captured).toMatchObject({ mode: 'replace' });
+  });
+
+  it('Import Config: Cancel closes the dialog without invoking import_config', async () => {
+    const user = userEvent.setup();
+    let importCalled = false;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_cert_info') return null;
+      if (cmd === 'get_proxy_config') return makeConfig();
+      if (cmd === 'import_config') {
+        importCalled = true;
+        return { host_rules_added: 0, intercept_rules_added: 0, block_rules_added: 0 };
+      }
+      return undefined;
+    });
+
+    render(<SetupPage />);
+    await waitFor(() =>
+      expect(screen.getByText(/No CA certificate found/i)).toBeInTheDocument(),
+    );
+
+    const fileInput = screen.getByTestId('import-config-file') as HTMLInputElement;
+    const file = new File(['{}'], 'proxie.json', { type: 'application/json' });
+    await user.upload(fileInput, file);
+
+    expect(await screen.findByRole('dialog')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /Cancel/i }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).toBeNull();
+    });
+    expect(importCalled).toBe(false);
+  });
+
+  it('Import Config: backend error surfaces in the alert banner', async () => {
+    const user = userEvent.setup();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_cert_info') return null;
+      if (cmd === 'get_proxy_config') return makeConfig();
+      if (cmd === 'import_config') throw new Error('invalid JSON');
+      return undefined;
+    });
+
+    render(<SetupPage />);
+    await waitFor(() =>
+      expect(screen.getByText(/No CA certificate found/i)).toBeInTheDocument(),
+    );
+
+    const fileInput = screen.getByTestId('import-config-file') as HTMLInputElement;
+    const file = new File(['not-json'], 'proxie.json', { type: 'application/json' });
+    await user.upload(fileInput, file);
+
+    expect(await screen.findByRole('dialog')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /^Import$/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert').textContent).toMatch(/Error: .*invalid JSON/);
+>>>>>>> origin/main
     });
   });
 

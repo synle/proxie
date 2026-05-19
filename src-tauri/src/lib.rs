@@ -12,7 +12,8 @@ use state::AppState;
 use std::sync::Arc;
 use tauri::Manager;
 use types::{
-    BlockRule, CertInfo, ConnectionLog, HostRule, InterceptRule, ProxyConfig, ProxyStatus,
+    BlockRule, CertInfo, ConnectionLog, HostRule, ImportMode, ImportSummary, InterceptRule,
+    ProxyConfig, ProxyStatus,
 };
 
 #[tauri::command]
@@ -152,6 +153,38 @@ async fn delete_block_rule(
         .map_err(|e| e.to_string())
 }
 
+/// Export the user's persisted rule sets (host / intercept / block) as a
+/// pretty-printed JSON string. Intended to be triggered by the Setup page
+/// "Export Config" button, then offered to the user as a `proxie.json`
+/// download.
+#[tauri::command]
+async fn export_config(state: tauri::State<'_, Arc<AppState>>) -> Result<String, String> {
+    state
+        .export_config(env!("CARGO_PKG_VERSION"))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Import a previously-exported configuration bundle.
+///
+/// # Arguments
+/// * `json` - Raw file contents read on the frontend.
+/// * `mode` - `"replace"` wipes existing rules per list, `"merge"` appends
+///   and skips duplicates by `id`.
+///
+/// # Errors
+/// Returns a user-safe `Err(String)` on invalid JSON, wrong shape, or an
+/// unknown mode. Raw paths and IO error chains are not leaked.
+#[tauri::command]
+async fn import_config(
+    state: tauri::State<'_, Arc<AppState>>,
+    json: String,
+    mode: String,
+) -> Result<ImportSummary, String> {
+    let mode = ImportMode::parse(&mode)?;
+    state.import_config(&json, mode).await
+}
+
 #[tauri::command]
 async fn get_connections(
     state: tauri::State<'_, Arc<AppState>>,
@@ -244,6 +277,14 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let app_state = Arc::new(AppState::new(app.handle()));
+            // Auto-load `<config-dir>/proxie.json` if present and the current
+            // config has no rules. Runs on the Tokio runtime that Tauri has
+            // already spun up. Errors are logged and swallowed — we never
+            // want a malformed sidecar to break app startup.
+            let autoload_state = Arc::clone(&app_state);
+            tauri::async_runtime::spawn(async move {
+                autoload_state.maybe_autoload_proxie_json().await;
+            });
             app.manage(app_state);
             Ok(())
         })
@@ -264,6 +305,8 @@ pub fn run() {
             add_block_rule,
             update_block_rule,
             delete_block_rule,
+            export_config,
+            import_config,
             get_connections,
             clear_connections,
             start_proxy,

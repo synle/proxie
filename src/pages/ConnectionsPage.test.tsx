@@ -279,7 +279,7 @@ describe('ConnectionsPage — body preview', () => {
     expect(screen.queryByText(/garbled/)).toBeNull();
   });
 
-  it('renders text bodies in a <pre> block', async () => {
+  it('renders text bodies in a <pre> block once the card is expanded', async () => {
     const row = makeConn({
       id: 'preview-3',
       response_body: '{"ok":true}',
@@ -295,6 +295,10 @@ describe('ConnectionsPage — body preview', () => {
     );
     await userEvent.click(screen.getByText('https://api.example.com/foo'));
 
+    // Default-collapsed: no <pre> visible.
+    expect(screen.queryByTestId('body-preview-text')).toBeNull();
+
+    await userEvent.click(screen.getByTestId('response-body-toggle'));
     const pre = await screen.findByTestId('body-preview-text');
     expect(pre).toHaveTextContent('{"ok":true}');
   });
@@ -328,7 +332,9 @@ describe('ConnectionsPage — format / codegen', () => {
     const fmtBtn = await screen.findByTestId('response-body-format');
     await userEvent.click(fmtBtn);
 
-    const pre = screen.getByTestId('body-preview-text');
+    // Format auto-expands the body card so the user immediately sees the
+    // pretty-printed output — no toggle click needed.
+    const pre = await screen.findByTestId('body-preview-text');
     // Multi-line + indented JSON output.
     expect(pre.textContent).toMatch(/\{\n {2}"a": 1,/);
     expect(pre.textContent).toMatch(/"b": \[\n {4}2,\n {4}3\n {2}\]\n\}/);
@@ -532,7 +538,7 @@ describe('ConnectionsPage — column filters', () => {
     invokeMock.mockReset();
   });
 
-  it('filters rows by URL-contains in the column header', async () => {
+  it('filters rows by URL-contains via the multi-clause URL filter modal', async () => {
     const user = userEvent.setup();
     const rows = [
       makeConn({ id: 'cf-1', url: 'https://api.alpha.com/x' }),
@@ -549,13 +555,152 @@ describe('ConnectionsPage — column filters', () => {
       expect(screen.getByText('https://api.beta.com/y')).toBeInTheDocument();
     });
 
-    const urlFilter = within(screen.getByTestId('url-filter')).getByRole('textbox');
-    await user.type(urlFilter, 'beta');
+    // Trigger button shows "any" when no clauses are configured.
+    const trigger = screen.getByTestId('url-filter-button');
+    expect(trigger).toHaveTextContent(/any/i);
+    await user.click(trigger);
+
+    // First clause row should already exist after Add.
+    await user.click(screen.getByTestId('url-filter-add-clause'));
+    const valueInput = within(screen.getByTestId('url-filter-clause-0')).getByTestId(
+      'url-filter-clause-value',
+    );
+    await user.type(valueInput, 'beta');
+    await user.click(screen.getByTestId('url-filter-save'));
 
     await waitFor(() => {
       expect(screen.queryByText('https://api.alpha.com/x')).toBeNull();
       expect(screen.getByText('https://api.beta.com/y')).toBeInTheDocument();
     });
+    // Trigger button now reflects active count.
+    expect(screen.getByTestId('url-filter-button')).toHaveTextContent(/1 filter/i);
+  });
+
+  it('combines two URL clauses with OR (default) and shows count badge on trigger', async () => {
+    const user = userEvent.setup();
+    const rows = [
+      makeConn({ id: 'or-1', url: 'https://api.foo.com/x' }),
+      makeConn({ id: 'or-2', url: 'https://api.example.com/bar' }),
+      makeConn({ id: 'or-3', url: 'https://nope.example.com/y' }),
+    ];
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return rows;
+      return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() => {
+      expect(screen.getByText('https://api.foo.com/x')).toBeInTheDocument();
+      expect(screen.getByText('https://api.example.com/bar')).toBeInTheDocument();
+      expect(screen.getByText('https://nope.example.com/y')).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByTestId('url-filter-button'));
+    // Add first clause: contains 'foo'.
+    await user.click(screen.getByTestId('url-filter-add-clause'));
+    const v0 = within(screen.getByTestId('url-filter-clause-0')).getByTestId(
+      'url-filter-clause-value',
+    );
+    await user.type(v0, 'foo');
+    // Add second clause: startsWith 'https://api'.
+    await user.click(screen.getByTestId('url-filter-add-clause'));
+    const row1 = screen.getByTestId('url-filter-clause-1');
+    await user.click(within(row1).getByRole('combobox'));
+    await user.click(await screen.findByRole('option', { name: /begins with/i }));
+    const v1 = within(row1).getByTestId('url-filter-clause-value');
+    await user.type(v1, 'https://api');
+
+    // Confirm OR is the default top-level combinator.
+    const orBtn = screen.getByTestId('url-filter-combinator-OR');
+    expect(orBtn).toHaveAttribute('aria-pressed', 'true');
+
+    await user.click(screen.getByTestId('url-filter-save'));
+
+    await waitFor(() => {
+      expect(screen.getByText('https://api.foo.com/x')).toBeInTheDocument();
+      expect(screen.getByText('https://api.example.com/bar')).toBeInTheDocument();
+      expect(screen.queryByText('https://nope.example.com/y')).toBeNull();
+    });
+
+    expect(screen.getByTestId('url-filter-button')).toHaveTextContent(/2 filter/i);
+  });
+
+  it('switches combinator to AND — only rows matching every clause appear', async () => {
+    const user = userEvent.setup();
+    const rows = [
+      // Matches "foo" contains AND startsWith "https://api".
+      makeConn({ id: 'and-1', url: 'https://api.foo.com/x' }),
+      // Matches contains "foo" only.
+      makeConn({ id: 'and-2', url: 'https://other.com/foo' }),
+      // Matches startsWith "https://api" only.
+      makeConn({ id: 'and-3', url: 'https://api.example.com/bar' }),
+    ];
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return rows;
+      return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() => {
+      expect(screen.getByText('https://api.foo.com/x')).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByTestId('url-filter-button'));
+    await user.click(screen.getByTestId('url-filter-add-clause'));
+    const v0 = within(screen.getByTestId('url-filter-clause-0')).getByTestId(
+      'url-filter-clause-value',
+    );
+    await user.type(v0, 'foo');
+    await user.click(screen.getByTestId('url-filter-add-clause'));
+    const row1 = screen.getByTestId('url-filter-clause-1');
+    await user.click(within(row1).getByRole('combobox'));
+    await user.click(await screen.findByRole('option', { name: /begins with/i }));
+    await user.type(within(row1).getByTestId('url-filter-clause-value'), 'https://api');
+
+    await user.click(screen.getByTestId('url-filter-combinator-AND'));
+    await user.click(screen.getByTestId('url-filter-save'));
+
+    await waitFor(() => {
+      expect(screen.getByText('https://api.foo.com/x')).toBeInTheDocument();
+      expect(screen.queryByText('https://other.com/foo')).toBeNull();
+      expect(screen.queryByText('https://api.example.com/bar')).toBeNull();
+    });
+  });
+
+  it('adding then removing a clause leaves an empty list — no URL filter applied', async () => {
+    const user = userEvent.setup();
+    const rows = [
+      makeConn({ id: 'rm-1', url: 'https://api.alpha.com/x' }),
+      makeConn({ id: 'rm-2', url: 'https://api.beta.com/y' }),
+    ];
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return rows;
+      return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() => {
+      expect(screen.getByText('https://api.alpha.com/x')).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByTestId('url-filter-button'));
+    await user.click(screen.getByTestId('url-filter-add-clause'));
+    await user.type(
+      within(screen.getByTestId('url-filter-clause-0')).getByTestId('url-filter-clause-value'),
+      'beta',
+    );
+    // Remove the only clause.
+    await user.click(
+      within(screen.getByTestId('url-filter-clause-0')).getByTestId('url-filter-clause-remove'),
+    );
+    await user.click(screen.getByTestId('url-filter-save'));
+
+    // Both rows remain visible — empty clause list means no URL filter.
+    await waitFor(() => {
+      expect(screen.getByText('https://api.alpha.com/x')).toBeInTheDocument();
+      expect(screen.getByText('https://api.beta.com/y')).toBeInTheDocument();
+    });
+    expect(screen.getByTestId('url-filter-button')).toHaveTextContent(/any/i);
   });
 
   it('filters rows by duration with the >= operator', async () => {
@@ -582,6 +727,153 @@ describe('ConnectionsPage — column filters', () => {
       expect(screen.getByText('https://api.slow.com/a')).toBeInTheDocument();
       expect(screen.queryByText('https://api.fast.com/b')).toBeNull();
     });
+  });
+});
+
+describe('ConnectionsPage — collapsible body cards', () => {
+  const invokeMock = invoke as unknown as ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  /** Build a body string with `n` distinct lines (line 1 … line n). */
+  function buildLongBody(n: number): string {
+    const out: string[] = [];
+    for (let i = 1; i <= n; i++) out.push(`line ${i}`);
+    return out.join('\n');
+  }
+
+  it('starts collapsed and reveals top 100 lines + "Show all" on expand', async () => {
+    const body = buildLongBody(250);
+    const row = makeConn({
+      id: 'collapse-1',
+      response_body: body,
+      content_type: 'text/plain',
+      response_headers: [['Content-Type', 'text/plain']] as [string, string][],
+    });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return [row];
+      return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() =>
+      expect(screen.getByText('https://api.example.com/foo')).toBeInTheDocument(),
+    );
+    await userEvent.click(screen.getByText('https://api.example.com/foo'));
+
+    // Default-collapsed: no <pre>, but Save / expand-toggle stay visible.
+    expect(await screen.findByTestId('response-body-toggle')).toBeInTheDocument();
+    expect(screen.queryByTestId('body-preview-text')).toBeNull();
+    expect(screen.getByTestId('response-body-save')).toBeInTheDocument();
+    expect(screen.getByTestId('response-body-collapsed-hint')).toHaveTextContent('250 lines');
+
+    // Expand → top 100 lines visible + a "Show all" CTA for the remaining 150.
+    await userEvent.click(screen.getByTestId('response-body-toggle'));
+    const pre = screen.getByTestId('body-preview-text');
+    expect(pre.textContent).toContain('line 1');
+    expect(pre.textContent).toContain('line 100');
+    expect(pre.textContent).not.toContain('line 101');
+    expect(pre.textContent).not.toContain('line 250');
+
+    const showAll = screen.getByTestId('response-body-show-all');
+    expect(showAll).toHaveTextContent('Show all (150 more lines)');
+
+    // Click Show all → every line is visible and the CTA disappears.
+    await userEvent.click(showAll);
+    const fullPre = screen.getByTestId('body-preview-text');
+    expect(fullPre.textContent).toContain('line 101');
+    expect(fullPre.textContent).toContain('line 250');
+    expect(screen.queryByTestId('response-body-show-all')).toBeNull();
+  });
+
+  it('omits "Show all" when the body fits in 100 lines', async () => {
+    const row = makeConn({
+      id: 'collapse-2',
+      response_body: buildLongBody(20),
+      content_type: 'text/plain',
+      response_headers: [['Content-Type', 'text/plain']] as [string, string][],
+    });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return [row];
+      return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() =>
+      expect(screen.getByText('https://api.example.com/foo')).toBeInTheDocument(),
+    );
+    await userEvent.click(screen.getByText('https://api.example.com/foo'));
+    await userEvent.click(await screen.findByTestId('response-body-toggle'));
+
+    expect(screen.getByTestId('body-preview-text').textContent).toContain('line 20');
+    expect(screen.queryByTestId('response-body-show-all')).toBeNull();
+  });
+
+  it('resets to collapsed when the selected connection changes', async () => {
+    const rowA = makeConn({
+      id: 'collapse-a',
+      url: 'https://api.example.com/aaa',
+      path: '/aaa',
+      response_body: buildLongBody(150),
+      content_type: 'text/plain',
+      response_headers: [['Content-Type', 'text/plain']] as [string, string][],
+    });
+    const rowB = makeConn({
+      id: 'collapse-b',
+      url: 'https://api.example.com/bbb',
+      path: '/bbb',
+      response_body: buildLongBody(150),
+      content_type: 'text/plain',
+      response_headers: [['Content-Type', 'text/plain']] as [string, string][],
+    });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return [rowA, rowB];
+      return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() =>
+      expect(screen.getByText('https://api.example.com/aaa')).toBeInTheDocument(),
+    );
+
+    // Expand on row A.
+    await userEvent.click(screen.getByText('https://api.example.com/aaa'));
+    await userEvent.click(await screen.findByTestId('response-body-toggle'));
+    expect(screen.getByTestId('body-preview-text')).toBeInTheDocument();
+
+    // Switch to row B — body must default back to collapsed.
+    await userEvent.click(screen.getByText('https://api.example.com/bbb'));
+    await waitFor(() => {
+      expect(screen.queryByTestId('body-preview-text')).toBeNull();
+    });
+    expect(screen.getByTestId('response-body-collapsed-hint')).toHaveTextContent('150 lines');
+  });
+
+  it('skips the collapse path for binary data: URI bodies', async () => {
+    const row = makeConn({
+      id: 'collapse-binary',
+      content_type: 'image/png',
+      response_headers: [['Content-Type', 'image/png']] as [string, string][],
+      response_body:
+        'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=',
+    });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return [row];
+      return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() =>
+      expect(screen.getByText('https://api.example.com/foo')).toBeInTheDocument(),
+    );
+    await userEvent.click(screen.getByText('https://api.example.com/foo'));
+
+    // Image preview is inline (no toggle / collapsed hint).
+    expect(await screen.findByTestId('body-preview-image')).toBeInTheDocument();
+    expect(screen.queryByTestId('response-body-toggle')).toBeNull();
+    expect(screen.queryByTestId('response-body-collapsed-hint')).toBeNull();
   });
 });
 
