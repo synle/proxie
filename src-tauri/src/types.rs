@@ -64,6 +64,12 @@ pub struct ConnectionLog {
     /// `#[serde(default)]` lets older persisted logs (pre v0.4.0) deserialize.
     #[serde(default)]
     pub blocked: bool,
+    /// User-toggled "flag for further investigation" marker. Lives only as
+    /// long as the in-memory connection log does (connections are never
+    /// persisted — see `state.rs`). `#[serde(default)]` keeps older
+    /// payloads (e.g. snapshots taken before v0.4.4) deserializable.
+    #[serde(default)]
+    pub bookmarked: bool,
 }
 
 /// A request-blocking rule. Matching requests are short-circuited with a
@@ -230,12 +236,14 @@ mod tests {
             content_type: Some("application/json".to_string()),
             intercepted: false,
             blocked: false,
+            bookmarked: false,
         };
         let json = serde_json::to_string(&log).unwrap();
         let back: ConnectionLog = serde_json::from_str(&json).unwrap();
         assert_eq!(back.status, Some(200));
         assert_eq!(back.duration_ms, Some(123));
         assert!(!back.blocked);
+        assert!(!back.bookmarked);
     }
 
     #[test]
@@ -259,6 +267,7 @@ mod tests {
             content_type: None,
             intercepted: false,
             blocked: true,
+            bookmarked: false,
         };
         let json = serde_json::to_string(&log).unwrap();
         assert!(json.contains("\"blocked\":true"));

@@ -395,6 +395,27 @@ impl AppState {
         Ok(())
     }
 
+    /// Toggle the bookmark flag on an in-memory connection log.
+    ///
+    /// Bookmarks are user-set "flag for further investigation" markers. Like
+    /// the rest of the connection list, they live only as long as the log
+    /// entry does — Proxie never persists connections to disk
+    /// (see [`AppState::add_connection`] for the 10k-row cap).
+    ///
+    /// # Arguments
+    /// * `id` - Connection log id (UUID assigned by the proxy when the
+    ///   request was first observed).
+    /// * `bookmarked` - New flag value.
+    ///
+    /// # Returns
+    /// `true` when a matching connection was found and updated, `false` when
+    /// no connection with that id is currently in memory (e.g. it was evicted
+    /// by the 10k-row cap or a `clear_connections` call).
+    pub async fn set_bookmark(&self, id: &str, bookmarked: bool) -> bool {
+        let mut conns = self.connections.lock().await;
+        apply_bookmark(&mut conns, id, bookmarked)
+    }
+
     // Proxy lifecycle
     pub async fn set_proxy_running(&self, port: u16, addr: &str) {
         let mut status = self.proxy_status.lock().await;
@@ -456,6 +477,28 @@ fn block_rule_matches(rule: &BlockRule, host: &str, path: &str) -> bool {
     match &rule.path_pattern {
         Some(p) => path_matches(p, path),
         None => true,
+    }
+}
+
+/// Toggle the `bookmarked` flag on the connection log whose `id` matches.
+///
+/// Extracted as a free function so unit tests can exercise the mutation
+/// without standing up an [`AppState`] (which needs a Tauri `AppHandle`).
+///
+/// # Arguments
+/// * `conns` - Mutable slice of in-memory connection logs.
+/// * `id` - Connection log id to locate.
+/// * `bookmarked` - New flag value.
+///
+/// # Returns
+/// `true` when a matching connection was updated, `false` when no entry
+/// with that id exists in `conns`.
+fn apply_bookmark(conns: &mut [ConnectionLog], id: &str, bookmarked: bool) -> bool {
+    if let Some(c) = conns.iter_mut().find(|c| c.id == id) {
+        c.bookmarked = bookmarked;
+        true
+    } else {
+        false
     }
 }
 
@@ -743,6 +786,49 @@ mod tests {
         assert!(block_rule_matches(&r, "api.example.com", "/"));
         // Host still has to match.
         assert!(!block_rule_matches(&r, "other.example.com", "/"));
+    }
+
+    fn make_conn(id: &str, bookmarked: bool) -> ConnectionLog {
+        ConnectionLog {
+            id: id.to_string(),
+            method: "GET".to_string(),
+            url: "https://api.example.com/x".to_string(),
+            host: "api.example.com".to_string(),
+            path: "/x".to_string(),
+            status: Some(200),
+            duration_ms: Some(1),
+            request_size: Some(0),
+            response_size: Some(0),
+            timestamp: "2026-05-18T00:00:00Z".to_string(),
+            request_headers: vec![],
+            response_headers: vec![],
+            request_body: None,
+            response_body: None,
+            content_type: None,
+            intercepted: false,
+            blocked: false,
+            bookmarked,
+        }
+    }
+
+    #[test]
+    fn test_apply_bookmark_toggles_existing_connection() {
+        // Round-trip: flag a connection, read it back, unflag, read it back.
+        let mut conns = vec![make_conn("a", false), make_conn("b", false)];
+        assert!(apply_bookmark(&mut conns, "a", true));
+        assert!(conns[0].bookmarked);
+        assert!(!conns[1].bookmarked);
+        assert!(apply_bookmark(&mut conns, "a", false));
+        assert!(!conns[0].bookmarked);
+    }
+
+    #[test]
+    fn test_apply_bookmark_unknown_id_returns_false() {
+        // Missing id must be a no-op + return false (rule 23 — empty/absent
+        // is a distinct outcome, not a silent success).
+        let mut conns = vec![make_conn("a", false)];
+        assert!(!apply_bookmark(&mut conns, "missing", true));
+        assert!(!conns[0].bookmarked);
     }
 
     #[test]

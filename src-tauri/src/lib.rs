@@ -164,6 +164,27 @@ async fn clear_connections(state: tauri::State<'_, Arc<AppState>>) -> Result<(),
     state.clear_connections().await.map_err(|e| e.to_string())
 }
 
+/// Flip the `bookmarked` flag on a single in-memory connection log.
+///
+/// Connections are not persisted (see CLAUDE.md / `state.rs`) so the
+/// bookmark lives only as long as the underlying connection log does.
+///
+/// # Arguments
+/// * `id` - Connection log id (UUID).
+/// * `bookmarked` - New flag value.
+///
+/// # Returns
+/// `true` when the connection was found and updated, `false` otherwise
+/// (already evicted, cleared, or never existed).
+#[tauri::command]
+async fn set_bookmark(
+    state: tauri::State<'_, Arc<AppState>>,
+    id: String,
+    bookmarked: bool,
+) -> Result<bool, String> {
+    Ok(state.set_bookmark(&id, bookmarked).await)
+}
+
 #[tauri::command]
 async fn start_proxy(
     app_handle: tauri::AppHandle,
@@ -214,6 +235,7 @@ pub fn run() {
             delete_block_rule,
             get_connections,
             clear_connections,
+            set_bookmark,
             start_proxy,
             stop_proxy,
             get_proxy_status,
