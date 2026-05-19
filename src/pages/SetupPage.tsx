@@ -11,10 +11,7 @@ import {
   Tab,
   Divider,
   Chip,
-<<<<<<< HEAD
   Link,
-||||||| b3f5f7d
-=======
   Dialog,
   DialogTitle,
   DialogContent,
@@ -25,7 +22,6 @@ import {
   FormControlLabel,
   FormLabel,
   Snackbar,
->>>>>>> origin/main
   Accordion,
   AccordionSummary,
   AccordionDetails,
@@ -215,7 +211,6 @@ export default function SetupPage() {
   };
 
   /**
-<<<<<<< HEAD
    * Open the proxy's self-served `/ping` endpoint in the user's default
    * browser via the Tauri opener plugin.
    *
@@ -231,8 +226,9 @@ export default function SetupPage() {
     } catch (e) {
       setStatus(`Error: ${e}`);
     }
-||||||| b3f5f7d
-=======
+  };
+
+  /**
    * Pull the user's rule config from the backend as pretty JSON, then push
    * it through the webview download pipeline as `proxie-YYYY-MM-DD.json`.
    */
@@ -287,7 +283,6 @@ export default function SetupPage() {
 
   const handleImportClick = () => {
     fileInputRef.current?.click();
->>>>>>> origin/main
   };
 
   const platformLabels = ['macOS', 'Windows', 'Linux (Ubuntu)'];

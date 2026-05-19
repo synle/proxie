@@ -2,14 +2,8 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
-<<<<<<< HEAD
 import { openUrl } from '@tauri-apps/plugin-opener';
-import SetupPage from './SetupPage';
-||||||| b3f5f7d
-import SetupPage from './SetupPage';
-=======
 import SetupPage, { makeExportFilename } from './SetupPage';
->>>>>>> origin/main
 
 function makeCert(overrides: Partial<Record<string, unknown>> = {}) {
   return {
@@ -241,7 +235,6 @@ describe('SetupPage', () => {
     });
   });
 
-<<<<<<< HEAD
   it('clicking the proxy URL opens the /ping endpoint in the default browser', async () => {
     const user = userEvent.setup();
     invokeMock.mockImplementation(async (cmd: string) => {
@@ -277,8 +270,9 @@ describe('SetupPage', () => {
 
     await waitFor(() => {
       expect(screen.getByRole('alert').textContent).toMatch(/Error: .*opener missing/);
-||||||| b3f5f7d
-=======
+    });
+  });
+
   it('makeExportFilename produces a YYYY-MM-DD suffix', () => {
     const name = makeExportFilename(new Date(2026, 4, 18)); // May 18, 2026
     expect(name).toBe('proxie-2026-05-18.json');
@@ -495,7 +489,6 @@ describe('SetupPage', () => {
 
     await waitFor(() => {
       expect(screen.getByRole('alert').textContent).toMatch(/Error: .*invalid JSON/);
->>>>>>> origin/main
     });
   });
 
