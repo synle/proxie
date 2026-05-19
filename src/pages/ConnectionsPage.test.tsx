@@ -305,9 +305,9 @@ describe('ConnectionsPage — format / codegen', () => {
     const fmtBtn = await screen.findByTestId('response-body-format');
     await userEvent.click(fmtBtn);
 
-    // Body card defaults collapsed — expand to inspect the formatted <pre>.
-    await userEvent.click(screen.getByTestId('response-body-toggle'));
-    const pre = screen.getByTestId('body-preview-text');
+    // Format auto-expands the body card so the user immediately sees the
+    // pretty-printed output — no toggle click needed.
+    const pre = await screen.findByTestId('body-preview-text');
     // Multi-line + indented JSON output.
     expect(pre.textContent).toMatch(/\{\n {2}"a": 1,/);
     expect(pre.textContent).toMatch(/"b": \[\n {4}2,\n {4}3\n {2}\]\n\}/);
@@ -548,5 +548,96 @@ describe('ConnectionsPage — collapsible body cards', () => {
     expect(await screen.findByTestId('body-preview-image')).toBeInTheDocument();
     expect(screen.queryByTestId('response-body-toggle')).toBeNull();
     expect(screen.queryByTestId('response-body-collapsed-hint')).toBeNull();
+  });
+});
+
+describe('ConnectionsPage — auto-reload on focus / visibility', () => {
+  const invokeMock = invoke as unknown as ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return [];
+      return undefined;
+    });
+    // Default to visible at the start of each test.
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true,
+      get: () => 'visible',
+    });
+  });
+
+  /**
+   * Count invokes of `get_connections` on the shared mock.
+   *
+   * @returns Number of calls to `invoke('get_connections', ...)`.
+   */
+  function getConnCallCount(): number {
+    return invokeMock.mock.calls.filter((c) => c[0] === 'get_connections').length;
+  }
+
+  it('reloads connections when the window receives focus', async () => {
+    render(<ConnectionsPage />);
+    await waitFor(() => {
+      expect(getConnCallCount()).toBeGreaterThanOrEqual(1);
+    });
+    const before = getConnCallCount();
+
+    window.dispatchEvent(new Event('focus'));
+
+    await waitFor(() => {
+      expect(getConnCallCount()).toBeGreaterThan(before);
+    });
+  });
+
+  it('reloads connections when document becomes visible', async () => {
+    render(<ConnectionsPage />);
+    await waitFor(() => {
+      expect(getConnCallCount()).toBeGreaterThanOrEqual(1);
+    });
+    const before = getConnCallCount();
+
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true,
+      get: () => 'visible',
+    });
+    document.dispatchEvent(new Event('visibilitychange'));
+
+    await waitFor(() => {
+      expect(getConnCallCount()).toBeGreaterThan(before);
+    });
+  });
+
+  it('does NOT reload when visibilitychange fires while hidden', async () => {
+    render(<ConnectionsPage />);
+    await waitFor(() => {
+      expect(getConnCallCount()).toBeGreaterThanOrEqual(1);
+    });
+    const before = getConnCallCount();
+
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true,
+      get: () => 'hidden',
+    });
+    document.dispatchEvent(new Event('visibilitychange'));
+
+    // Give any erroneous fetch a tick to fire.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(getConnCallCount()).toBe(before);
+  });
+
+  it('removes focus / visibilitychange listeners on unmount', async () => {
+    const { unmount } = render(<ConnectionsPage />);
+    await waitFor(() => {
+      expect(getConnCallCount()).toBeGreaterThanOrEqual(1);
+    });
+
+    unmount();
+    const before = getConnCallCount();
+    window.dispatchEvent(new Event('focus'));
+    document.dispatchEvent(new Event('visibilitychange'));
+
+    await new Promise((r) => setTimeout(r, 50));
+    expect(getConnCallCount()).toBe(before);
   });
 });

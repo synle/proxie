@@ -404,6 +404,9 @@ describe('ConnectionsPage — formatters', () => {
     );
     await userEvent.click(screen.getByText('https://api.example.com/foo'));
 
+    // Expand the response body card (default-collapsed for the new feature).
+    await userEvent.click(await screen.findByTestId('response-body-toggle'));
+
     // Body preview text rendered, but no format button for this MIME.
     expect(await screen.findByTestId('body-preview-text')).toBeInTheDocument();
     expect(screen.queryByTestId('response-body-format')).toBeNull();
