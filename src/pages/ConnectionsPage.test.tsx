@@ -279,7 +279,7 @@ describe('ConnectionsPage — body preview', () => {
     expect(screen.queryByText(/garbled/)).toBeNull();
   });
 
-  it('renders text bodies in a <pre> block', async () => {
+  it('renders text bodies in a <pre> block once the card is expanded', async () => {
     const row = makeConn({
       id: 'preview-3',
       response_body: '{"ok":true}',
@@ -295,6 +295,10 @@ describe('ConnectionsPage — body preview', () => {
     );
     await userEvent.click(screen.getByText('https://api.example.com/foo'));
 
+    // Default-collapsed: no <pre> visible.
+    expect(screen.queryByTestId('body-preview-text')).toBeNull();
+
+    await userEvent.click(screen.getByTestId('response-body-toggle'));
     const pre = await screen.findByTestId('body-preview-text');
     expect(pre).toHaveTextContent('{"ok":true}');
   });
@@ -328,7 +332,9 @@ describe('ConnectionsPage — format / codegen', () => {
     const fmtBtn = await screen.findByTestId('response-body-format');
     await userEvent.click(fmtBtn);
 
-    const pre = screen.getByTestId('body-preview-text');
+    // Format auto-expands the body card so the user immediately sees the
+    // pretty-printed output — no toggle click needed.
+    const pre = await screen.findByTestId('body-preview-text');
     // Multi-line + indented JSON output.
     expect(pre.textContent).toMatch(/\{\n {2}"a": 1,/);
     expect(pre.textContent).toMatch(/"b": \[\n {4}2,\n {4}3\n {2}\]\n\}/);
@@ -582,6 +588,153 @@ describe('ConnectionsPage — column filters', () => {
       expect(screen.getByText('https://api.slow.com/a')).toBeInTheDocument();
       expect(screen.queryByText('https://api.fast.com/b')).toBeNull();
     });
+  });
+});
+
+describe('ConnectionsPage — collapsible body cards', () => {
+  const invokeMock = invoke as unknown as ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  /** Build a body string with `n` distinct lines (line 1 … line n). */
+  function buildLongBody(n: number): string {
+    const out: string[] = [];
+    for (let i = 1; i <= n; i++) out.push(`line ${i}`);
+    return out.join('\n');
+  }
+
+  it('starts collapsed and reveals top 100 lines + "Show all" on expand', async () => {
+    const body = buildLongBody(250);
+    const row = makeConn({
+      id: 'collapse-1',
+      response_body: body,
+      content_type: 'text/plain',
+      response_headers: [['Content-Type', 'text/plain']] as [string, string][],
+    });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return [row];
+      return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() =>
+      expect(screen.getByText('https://api.example.com/foo')).toBeInTheDocument(),
+    );
+    await userEvent.click(screen.getByText('https://api.example.com/foo'));
+
+    // Default-collapsed: no <pre>, but Save / expand-toggle stay visible.
+    expect(await screen.findByTestId('response-body-toggle')).toBeInTheDocument();
+    expect(screen.queryByTestId('body-preview-text')).toBeNull();
+    expect(screen.getByTestId('response-body-save')).toBeInTheDocument();
+    expect(screen.getByTestId('response-body-collapsed-hint')).toHaveTextContent('250 lines');
+
+    // Expand → top 100 lines visible + a "Show all" CTA for the remaining 150.
+    await userEvent.click(screen.getByTestId('response-body-toggle'));
+    const pre = screen.getByTestId('body-preview-text');
+    expect(pre.textContent).toContain('line 1');
+    expect(pre.textContent).toContain('line 100');
+    expect(pre.textContent).not.toContain('line 101');
+    expect(pre.textContent).not.toContain('line 250');
+
+    const showAll = screen.getByTestId('response-body-show-all');
+    expect(showAll).toHaveTextContent('Show all (150 more lines)');
+
+    // Click Show all → every line is visible and the CTA disappears.
+    await userEvent.click(showAll);
+    const fullPre = screen.getByTestId('body-preview-text');
+    expect(fullPre.textContent).toContain('line 101');
+    expect(fullPre.textContent).toContain('line 250');
+    expect(screen.queryByTestId('response-body-show-all')).toBeNull();
+  });
+
+  it('omits "Show all" when the body fits in 100 lines', async () => {
+    const row = makeConn({
+      id: 'collapse-2',
+      response_body: buildLongBody(20),
+      content_type: 'text/plain',
+      response_headers: [['Content-Type', 'text/plain']] as [string, string][],
+    });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return [row];
+      return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() =>
+      expect(screen.getByText('https://api.example.com/foo')).toBeInTheDocument(),
+    );
+    await userEvent.click(screen.getByText('https://api.example.com/foo'));
+    await userEvent.click(await screen.findByTestId('response-body-toggle'));
+
+    expect(screen.getByTestId('body-preview-text').textContent).toContain('line 20');
+    expect(screen.queryByTestId('response-body-show-all')).toBeNull();
+  });
+
+  it('resets to collapsed when the selected connection changes', async () => {
+    const rowA = makeConn({
+      id: 'collapse-a',
+      url: 'https://api.example.com/aaa',
+      path: '/aaa',
+      response_body: buildLongBody(150),
+      content_type: 'text/plain',
+      response_headers: [['Content-Type', 'text/plain']] as [string, string][],
+    });
+    const rowB = makeConn({
+      id: 'collapse-b',
+      url: 'https://api.example.com/bbb',
+      path: '/bbb',
+      response_body: buildLongBody(150),
+      content_type: 'text/plain',
+      response_headers: [['Content-Type', 'text/plain']] as [string, string][],
+    });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return [rowA, rowB];
+      return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() =>
+      expect(screen.getByText('https://api.example.com/aaa')).toBeInTheDocument(),
+    );
+
+    // Expand on row A.
+    await userEvent.click(screen.getByText('https://api.example.com/aaa'));
+    await userEvent.click(await screen.findByTestId('response-body-toggle'));
+    expect(screen.getByTestId('body-preview-text')).toBeInTheDocument();
+
+    // Switch to row B — body must default back to collapsed.
+    await userEvent.click(screen.getByText('https://api.example.com/bbb'));
+    await waitFor(() => {
+      expect(screen.queryByTestId('body-preview-text')).toBeNull();
+    });
+    expect(screen.getByTestId('response-body-collapsed-hint')).toHaveTextContent('150 lines');
+  });
+
+  it('skips the collapse path for binary data: URI bodies', async () => {
+    const row = makeConn({
+      id: 'collapse-binary',
+      content_type: 'image/png',
+      response_headers: [['Content-Type', 'image/png']] as [string, string][],
+      response_body:
+        'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=',
+    });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return [row];
+      return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() =>
+      expect(screen.getByText('https://api.example.com/foo')).toBeInTheDocument(),
+    );
+    await userEvent.click(screen.getByText('https://api.example.com/foo'));
+
+    // Image preview is inline (no toggle / collapsed hint).
+    expect(await screen.findByTestId('body-preview-image')).toBeInTheDocument();
+    expect(screen.queryByTestId('response-body-toggle')).toBeNull();
+    expect(screen.queryByTestId('response-body-collapsed-hint')).toBeNull();
   });
 });
 
