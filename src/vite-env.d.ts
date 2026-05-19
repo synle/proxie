@@ -5,5 +5,6 @@
 // runtime variables — treat them as `const` globals.
 declare const __APP_VERSION__: string;
 declare const __BUILD_DATE__: string;
+declare const __BUILD_TIME__: string;
 declare const __GIT_SHA__: string;
 declare const __RELEASE_CHANNEL__: 'dev' | 'beta' | 'official';
