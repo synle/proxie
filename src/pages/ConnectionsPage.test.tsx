@@ -365,6 +365,166 @@ describe('ConnectionsPage — format / codegen', () => {
   });
 });
 
+describe('ConnectionsPage — columns picker', () => {
+  const invokeMock = invoke as unknown as ReturnType<typeof vi.fn>;
+  const STORAGE_KEY = 'proxie:connections:visibleColumns';
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+    localStorage.clear();
+  });
+
+  it('shows all default columns on first render', async () => {
+    const row = makeConn({ id: 'col-1' });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return [row];
+      return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() =>
+      expect(screen.getByText('https://api.example.com/foo')).toBeInTheDocument(),
+    );
+
+    // Default visible columns.
+    expect(screen.getByRole('columnheader', { name: 'Method' })).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: 'URL' })).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: 'Status' })).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: 'Duration' })).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: 'Size' })).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: 'Time' })).toBeInTheDocument();
+  });
+
+  it('toggling a column off via the picker hides it and persists to localStorage', async () => {
+    const user = userEvent.setup();
+    const row = makeConn({ id: 'col-2' });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return [row];
+      return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() =>
+      expect(screen.getByText('https://api.example.com/foo')).toBeInTheDocument(),
+    );
+
+    await user.click(screen.getByTestId('columns-button'));
+    const sizeCheckbox = await screen.findByTestId('column-toggle-size');
+    await user.click(within(sizeCheckbox).getByRole('checkbox'));
+
+    await waitFor(() => {
+      expect(screen.queryByRole('columnheader', { name: 'Size' })).toBeNull();
+    });
+    const stored = localStorage.getItem(STORAGE_KEY);
+    expect(stored).not.toBeNull();
+    const parsed = JSON.parse(stored as string) as string[];
+    expect(parsed).not.toContain('size');
+    expect(parsed).toContain('method');
+  });
+
+  it('restores hidden columns from localStorage on mount', async () => {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(['method', 'url', 'status', 'duration', 'time']),
+    );
+    const row = makeConn({ id: 'col-3' });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return [row];
+      return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() =>
+      expect(screen.getByText('https://api.example.com/foo')).toBeInTheDocument(),
+    );
+
+    // Size should be hidden because it's not in the persisted set.
+    expect(screen.queryByRole('columnheader', { name: 'Size' })).toBeNull();
+    expect(screen.getByRole('columnheader', { name: 'Method' })).toBeInTheDocument();
+  });
+
+  it('renders request/response body previews truncated to ~80 chars when enabled', async () => {
+    const user = userEvent.setup();
+    const longBody = 'x'.repeat(200);
+    const row = makeConn({
+      id: 'col-4',
+      request_body: longBody,
+      response_body: longBody,
+      request_headers: [['Content-Type', 'application/json']] as [string, string][],
+      response_headers: [['Content-Type', 'application/json']] as [string, string][],
+    });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return [row];
+      return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() =>
+      expect(screen.getByText('https://api.example.com/foo')).toBeInTheDocument(),
+    );
+
+    // Enable the optional columns.
+    await user.click(screen.getByTestId('columns-button'));
+    const reqBodyToggle = await screen.findByTestId('column-toggle-request_body');
+    const respBodyToggle = await screen.findByTestId('column-toggle-response_body');
+    const reqCtToggle = await screen.findByTestId('column-toggle-request_content_type');
+    const respCtToggle = await screen.findByTestId('column-toggle-response_content_type');
+    await user.click(within(reqBodyToggle).getByRole('checkbox'));
+    await user.click(within(respBodyToggle).getByRole('checkbox'));
+    await user.click(within(reqCtToggle).getByRole('checkbox'));
+    await user.click(within(respCtToggle).getByRole('checkbox'));
+    // Close popover by pressing Escape.
+    await user.keyboard('{Escape}');
+
+    await waitFor(() => {
+      expect(screen.getByRole('columnheader', { name: 'Request Body' })).toBeInTheDocument();
+      expect(screen.getByRole('columnheader', { name: 'Response Body' })).toBeInTheDocument();
+    });
+
+    const reqBodyCell = screen.getByTestId('cell-request_body');
+    const respBodyCell = screen.getByTestId('cell-response_body');
+    // Truncated: 80 chars + ellipsis.
+    expect(reqBodyCell.textContent?.endsWith('…')).toBe(true);
+    expect(respBodyCell.textContent?.endsWith('…')).toBe(true);
+    // No 200-char raw string in the cell.
+    expect(reqBodyCell.textContent?.length).toBeLessThan(200);
+
+    // Content-Type columns reflect headers.
+    expect(screen.getByTestId('cell-request_content_type')).toHaveTextContent(
+      'application/json',
+    );
+    expect(screen.getByTestId('cell-response_content_type')).toHaveTextContent(
+      'application/json',
+    );
+  });
+
+  it('shows (binary) preview for data: URI request bodies', async () => {
+    const user = userEvent.setup();
+    const row = makeConn({
+      id: 'col-5',
+      request_body: 'data:image/png;base64,iVBOR',
+    });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_connections') return [row];
+      return undefined;
+    });
+
+    render(<ConnectionsPage />);
+    await waitFor(() =>
+      expect(screen.getByText('https://api.example.com/foo')).toBeInTheDocument(),
+    );
+
+    await user.click(screen.getByTestId('columns-button'));
+    const reqBodyToggle = await screen.findByTestId('column-toggle-request_body');
+    await user.click(within(reqBodyToggle).getByRole('checkbox'));
+    await user.keyboard('{Escape}');
+
+    await waitFor(() => {
+      expect(screen.getByTestId('cell-request_body')).toHaveTextContent('(binary)');
+    });
+  });
+});
+
 describe('ConnectionsPage — column filters', () => {
   const invokeMock = invoke as unknown as ReturnType<typeof vi.fn>;
 
