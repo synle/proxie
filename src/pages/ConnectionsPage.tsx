@@ -409,13 +409,18 @@ export default function ConnectionsPage() {
     null,
   );
   const bottomRef = useRef<HTMLDivElement>(null);
+  const inFlightRef = useRef(false);
 
   const loadConnections = useCallback(async () => {
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
     try {
       const data = await invoke<ConnectionLog[]>('get_connections');
       setConnections(data ?? []);
     } catch (e) {
       console.error('Failed to load connections:', e);
+    } finally {
+      inFlightRef.current = false;
     }
   }, []);
 
@@ -428,6 +433,28 @@ export default function ConnectionsPage() {
 
     return () => {
       unlisten.then((fn) => fn());
+    };
+  }, [loadConnections]);
+
+  // Auto-reload when the window regains focus or the document becomes visible
+  // again. Users frequently background the app while a request is in flight,
+  // and we want them to see the latest connections without having to hit the
+  // refresh icon. `inFlightRef` (inside `loadConnections`) coalesces overlapping
+  // triggers so focus + visibilitychange firing back-to-back does not double-fetch.
+  useEffect(() => {
+    const handleFocus = () => {
+      loadConnections();
+    };
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        loadConnections();
+      }
+    };
+    window.addEventListener('focus', handleFocus);
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      window.removeEventListener('focus', handleFocus);
+      document.removeEventListener('visibilitychange', handleVisibility);
     };
   }, [loadConnections]);
 
