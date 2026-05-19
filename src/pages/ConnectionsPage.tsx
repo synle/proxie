@@ -30,11 +30,17 @@ import RefreshIcon from '@mui/icons-material/Refresh';
 import DownloadIcon from '@mui/icons-material/Download';
 import AutoFixHighIcon from '@mui/icons-material/AutoFixHigh';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
+import StarIcon from '@mui/icons-material/Star';
+import StarBorderIcon from '@mui/icons-material/StarBorder';
+import FileDownloadIcon from '@mui/icons-material/FileDownload';
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 import ExpandLessIcon from '@mui/icons-material/ExpandLess';
 import SearchIcon from '@mui/icons-material/Search';
+import { Menu } from '@mui/material';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { CODEGEN, CODEGEN_LANGS, generateBundle } from '../lib/codegen';
+import { connectionsToHar } from '../lib/har';
 import UrlFilterDialog, {
   DEFAULT_URL_FILTERS,
   activeClauseCount,
@@ -69,6 +75,8 @@ interface ConnectionLog {
   intercepted: boolean;
   /** True when the request was short-circuited by a block rule. */
   blocked?: boolean;
+  /** User-toggled "flag for further investigation" marker. */
+  bookmarked?: boolean;
 }
 
 function statusColor(status: number | null): 'success' | 'warning' | 'error' | 'default' {
@@ -318,74 +326,10 @@ function inferFilename(url: string, mime: string, suffix: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Code generators for curl / python-requests / node fetch.
+// Code generators — see src/lib/codegen.ts for the registry. New languages
+// (java, c#, ...) plug in via a single entry there; nothing in this file
+// needs to change.
 // ---------------------------------------------------------------------------
-
-type CodegenLang = 'curl' | 'python' | 'node';
-
-function shellQuote(s: string): string {
-  return `'${s.replace(/'/g, `'\\''`)}'`;
-}
-
-function pyQuote(s: string): string {
-  return JSON.stringify(s);
-}
-
-function generateCode(conn: ConnectionLog, lang: CodegenLang): string {
-  const headers = conn.request_headers ?? [];
-  const body = conn.request_body ?? '';
-  const hasBody = body.length > 0 && conn.method !== 'GET' && conn.method !== 'HEAD';
-  // For binary bodies we placeholder-out the payload — base64 round-tripping
-  // would just confuse the user pasting this into a terminal.
-  const isBinaryBody = body.startsWith('data:');
-  const bodyForCode = isBinaryBody ? '<binary body — see request in Proxie>' : body;
-
-  if (lang === 'curl') {
-    const lines = [`curl -X ${conn.method} ${shellQuote(conn.url)}`];
-    for (const [k, v] of headers) {
-      lines.push(`  -H ${shellQuote(`${k}: ${v}`)}`);
-    }
-    if (hasBody) {
-      lines.push(`  --data-raw ${shellQuote(bodyForCode)}`);
-    }
-    return lines.join(' \\\n');
-  }
-
-  if (lang === 'python') {
-    const hdrEntries = headers.map(([k, v]) => `    ${pyQuote(k)}: ${pyQuote(v)},`).join('\n');
-    const lines = [
-      'import requests',
-      '',
-      `url = ${pyQuote(conn.url)}`,
-      `headers = {\n${hdrEntries}\n}` || 'headers = {}',
-    ];
-    if (hasBody) {
-      lines.push(`data = ${pyQuote(bodyForCode)}`);
-      lines.push(
-        `resp = requests.request(${pyQuote(conn.method)}, url, headers=headers, data=data)`,
-      );
-    } else {
-      lines.push(`resp = requests.request(${pyQuote(conn.method)}, url, headers=headers)`);
-    }
-    lines.push('print(resp.status_code)');
-    lines.push('print(resp.text)');
-    return lines.join('\n');
-  }
-
-  // node fetch
-  const hdrLines = headers.map(([k, v]) => `    ${JSON.stringify(k)}: ${JSON.stringify(v)},`).join('\n');
-  const initLines: string[] = [`  method: ${JSON.stringify(conn.method)},`];
-  initLines.push(`  headers: {\n${hdrLines}\n  },`);
-  if (hasBody) initLines.push(`  body: ${JSON.stringify(bodyForCode)},`);
-  return [
-    `const url = ${JSON.stringify(conn.url)};`,
-    `const resp = await fetch(url, {`,
-    initLines.join('\n'),
-    `});`,
-    `console.log(resp.status);`,
-    `console.log(await resp.text());`,
-  ].join('\n');
-}
 
 // ---------------------------------------------------------------------------
 // Column-filter state & helpers
@@ -571,6 +515,25 @@ export default function ConnectionsPage() {
     }
   };
 
+  /**
+   * Toggle the bookmark flag on a single row. Optimistically mutates
+   * local state, then calls the backend; failures revert via the
+   * subsequent `loadConnections`/`proxy:connection` refresh path.
+   *
+   * @param id - Connection log id to flag.
+   * @param next - Desired bookmark value.
+   */
+  const handleToggleBookmark = useCallback(async (id: string, next: boolean) => {
+    setConnections((prev) =>
+      prev.map((c) => (c.id === id ? { ...c, bookmarked: next } : c)),
+    );
+    try {
+      await invoke('set_bookmark', { id, bookmarked: next });
+    } catch (e) {
+      console.error('Failed to set bookmark:', e);
+    }
+  }, []);
+
   const updateVisibleColumns = useCallback((next: Set<string>) => {
     setVisibleColumns(next);
     saveVisibleColumns(next);
@@ -621,6 +584,7 @@ export default function ConnectionsPage() {
               }}
             />
           </Box>
+          <ExportMenu connections={filtered} allConnections={connections} />
           <Tooltip title='Refresh'>
             <IconButton size='small' onClick={loadConnections}>
               <RefreshIcon />
@@ -642,6 +606,9 @@ export default function ConnectionsPage() {
           <Table size='small' stickyHeader>
             <TableHead>
               <TableRow>
+                <TableCell width={44} padding='none' align='center'>
+                  ★
+                </TableCell>
                 {isVisible('method') && <TableCell width={120}>Method</TableCell>}
                 {isVisible('url') && <TableCell>URL</TableCell>}
                 {isVisible('status') && <TableCell width={90}>Status</TableCell>}
@@ -667,7 +634,7 @@ export default function ConnectionsPage() {
             <TableBody>
               {filtered.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={visibleSpecs.length || 1} align='center' sx={{ py: 4 }}>
+                  <TableCell colSpan={(visibleSpecs.length || 0) + 1} align='center' sx={{ py: 4 }}>
                     <Typography variant='body2' color='text.secondary'>
                       {connections.length === 0
                         ? 'No connections yet. Start the proxy and configure your system to use it.'
@@ -683,6 +650,27 @@ export default function ConnectionsPage() {
                   selected={selected?.id === conn.id}
                   onClick={() => setSelected(conn)}
                   sx={{ cursor: 'pointer' }}>
+                  <TableCell padding='none' align='center'>
+                    <Tooltip
+                      title={conn.bookmarked ? 'Remove bookmark' : 'Flag for further investigation'}>
+                      <IconButton
+                        data-testid={`bookmark-${conn.id}`}
+                        size='small'
+                        aria-label={conn.bookmarked ? 'remove bookmark' : 'add bookmark'}
+                        aria-pressed={!!conn.bookmarked}
+                        onClick={(e) => {
+                          // Don't open the detail drawer when clicking the star.
+                          e.stopPropagation();
+                          handleToggleBookmark(conn.id, !conn.bookmarked);
+                        }}>
+                        {conn.bookmarked ? (
+                          <StarIcon fontSize='small' sx={{ color: 'warning.light' }} />
+                        ) : (
+                          <StarBorderIcon fontSize='small' />
+                        )}
+                      </IconButton>
+                    </Tooltip>
+                  </TableCell>
                   {isVisible('method') && (
                     <TableCell>
                       <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
@@ -884,6 +872,7 @@ function FilterRow({
 
   return (
     <TableRow data-testid='column-filter-row' sx={{ '& > th': { py: 0.5 } }}>
+      <TableCell padding='none' />
       {isVisible('method') && (
         <TableCell>
           <FormControl size='small' fullWidth>
@@ -1051,7 +1040,7 @@ function DetailDrawerContent({
 }) {
   const [reqDisplay, setReqDisplay] = useState<string | null>(null);
   const [respDisplay, setRespDisplay] = useState<string | null>(null);
-  const [codegenLang, setCodegenLang] = useState<CodegenLang>('curl');
+  const [codegenLang, setCodegenLang] = useState<string>('curl');
   // Body-card collapse state — both cards start collapsed, top-100-lines view
   // when expanded; "Show all" reveals the rest.
   const [requestBodyExpanded, setRequestBodyExpanded] = useState(false);
@@ -1075,7 +1064,10 @@ function DetailDrawerContent({
     headerLookup(conn.response_headers, 'content-type') ?? conn.content_type,
   );
 
-  const generatedCode = useMemo(() => generateCode(conn, codegenLang), [conn, codegenLang]);
+  const generatedCode = useMemo(
+    () => (CODEGEN[codegenLang] ? CODEGEN[codegenLang].generate(conn) : ''),
+    [conn, codegenLang],
+  );
 
   return (
     <Box>
@@ -1203,11 +1195,13 @@ function DetailDrawerContent({
           <Select
             data-testid='codegen-lang'
             value={codegenLang}
-            onChange={(e) => setCodegenLang(e.target.value as CodegenLang)}
+            onChange={(e) => setCodegenLang(e.target.value)}
             sx={{ fontSize: '0.8rem' }}>
-            <MenuItem value='curl'>curl</MenuItem>
-            <MenuItem value='python'>python (requests)</MenuItem>
-            <MenuItem value='node'>node (fetch)</MenuItem>
+            {CODEGEN_LANGS.map((lang) => (
+              <MenuItem key={lang} value={lang}>
+                {CODEGEN[lang].label}
+              </MenuItem>
+            ))}
           </Select>
         </FormControl>
         <Tooltip title='Copy to clipboard'>
@@ -1523,5 +1517,133 @@ function DetailRow({
         {value}
       </Typography>
     </Box>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Export menu — page-level dropdown that emits Blob downloads for HAR + every
+// codegen language, in "all" and "bookmarked only" flavors. Built on the same
+// `CODEGEN_LANGS` registry the per-row dropdown consumes, so new languages
+// appear automatically.
+// ---------------------------------------------------------------------------
+
+/**
+ * Trigger a browser download for an in-memory string by spinning up a
+ * `Blob` URL.
+ *
+ * @param content - Text to write to the downloaded file.
+ * @param mime - MIME type to stamp on the Blob.
+ * @param filename - Suggested file name shown by the OS save dialog.
+ */
+function downloadText(content: string, mime: string, filename: string): void {
+  const blob = new Blob([content], { type: mime || 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/**
+ * Render the toolbar "Export" dropdown.
+ *
+ * @param connections - The currently-filtered connections (used as the
+ *   "all" set so the export honors visible filters).
+ * @param allConnections - Full connection list — `bookmarked` exports
+ *   read from here so users can flag a row, filter to something else,
+ *   and still export the bookmarked rows.
+ */
+function ExportMenu({
+  connections,
+  allConnections,
+}: {
+  connections: ConnectionLog[];
+  allConnections: ConnectionLog[];
+}) {
+  const [anchorEl, setAnchorEl] = useState<HTMLElement | null>(null);
+  const open = Boolean(anchorEl);
+  const bookmarked = useMemo(
+    () => allConnections.filter((c) => c.bookmarked),
+    [allConnections],
+  );
+
+  /**
+   * Resolve the connection set + filename suffix for a scope choice.
+   *
+   * @param scope - `'all'` exports the filtered visible rows; `'bookmarked'`
+   *   exports every starred row regardless of filter.
+   */
+  const setFor = (scope: 'all' | 'bookmarked') =>
+    scope === 'all'
+      ? { rows: connections, suffix: 'all' }
+      : { rows: bookmarked, suffix: 'bookmarked' };
+
+  const handleHar = (scope: 'all' | 'bookmarked') => {
+    const { rows, suffix } = setFor(scope);
+    const har = connectionsToHar(rows);
+    downloadText(
+      JSON.stringify(har, null, 2),
+      'application/json',
+      `proxie-${suffix}.har`,
+    );
+    setAnchorEl(null);
+  };
+
+  const handleCode = (lang: string, scope: 'all' | 'bookmarked') => {
+    const entry = CODEGEN[lang];
+    if (!entry) return;
+    const { rows, suffix } = setFor(scope);
+    const bundle = generateBundle(lang, rows);
+    downloadText(bundle, 'text/plain', `proxie-${suffix}.${entry.ext}`);
+    setAnchorEl(null);
+  };
+
+  return (
+    <>
+      <Tooltip title='Export connections'>
+        <span>
+          <IconButton
+            size='small'
+            data-testid='export-menu-button'
+            onClick={(e) => setAnchorEl(e.currentTarget)}>
+            <FileDownloadIcon />
+          </IconButton>
+        </span>
+      </Tooltip>
+      <Menu
+        anchorEl={anchorEl}
+        open={open}
+        onClose={() => setAnchorEl(null)}
+        data-testid='export-menu'
+        slotProps={{ paper: { 'data-testid': 'export-menu-paper' } as never }}>
+        <MenuItem
+          data-testid='export-har-all'
+          onClick={() => handleHar('all')}>
+          HAR (all)
+        </MenuItem>
+        <MenuItem
+          data-testid='export-har-bookmarked'
+          onClick={() => handleHar('bookmarked')}>
+          HAR (bookmarked only)
+        </MenuItem>
+        {CODEGEN_LANGS.flatMap((lang) => [
+          <MenuItem
+            key={`${lang}-all`}
+            data-testid={`export-${lang}-all`}
+            onClick={() => handleCode(lang, 'all')}>
+            {CODEGEN[lang].label} (all)
+          </MenuItem>,
+          <MenuItem
+            key={`${lang}-bookmarked`}
+            data-testid={`export-${lang}-bookmarked`}
+            onClick={() => handleCode(lang, 'bookmarked')}>
+            {CODEGEN[lang].label} (bookmarked)
+          </MenuItem>,
+        ])}
+      </Menu>
+    </>
   );
 }

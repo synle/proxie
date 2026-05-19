@@ -374,6 +374,7 @@ async fn blind_tunnel(
         content_type: None,
         intercepted: false,
         blocked: false,
+        bookmarked: false,
     };
     state.add_connection(conn.clone()).await;
     let _ = app_handle.emit("proxy:connection", &conn);
@@ -681,6 +682,7 @@ async fn mitm_connect(
             content_type: Some("text/plain; charset=utf-8".to_string()),
             intercepted: false,
             blocked: false,
+            bookmarked: false,
         };
         state.add_connection(conn.clone()).await;
         let _ = app_handle.emit("proxy:connection", &conn);
@@ -719,6 +721,7 @@ async fn mitm_connect(
         content_type,
         intercepted: false,
         blocked: false,
+        bookmarked: false,
     };
     state.add_connection(conn.clone()).await;
     let _ = app_handle.emit("proxy:connection", &conn);
@@ -779,6 +782,7 @@ async fn serve_intercept_over_tls(
                 content_type: Some(content_type),
                 intercepted: true,
                 blocked: false,
+                bookmarked: false,
             };
             state.add_connection(conn.clone()).await;
             let _ = app_handle.emit("proxy:connection", &conn);
@@ -864,6 +868,7 @@ async fn serve_intercept_over_tls(
                     content_type: Some("text/plain; charset=utf-8".to_string()),
                     intercepted: true,
                     blocked: false,
+                    bookmarked: false,
                 };
                 state.add_connection(conn.clone()).await;
                 let _ = app_handle.emit("proxy:connection", &conn);
@@ -895,6 +900,7 @@ async fn serve_intercept_over_tls(
                 content_type,
                 intercepted: true,
                 blocked: false,
+                bookmarked: false,
             };
             state.add_connection(conn.clone()).await;
             let _ = app_handle.emit("proxy:connection", &conn);
@@ -938,6 +944,7 @@ async fn log_mitm_failure(
         content_type: None,
         intercepted: false,
         blocked: false,
+        bookmarked: false,
     };
     state.add_connection(conn.clone()).await;
     let _ = app_handle.emit("proxy:connection", &conn);
@@ -1409,6 +1416,7 @@ async fn handle_http_request(
             content_type: Some("text/plain; charset=utf-8".to_string()),
             intercepted: false,
             blocked: false,
+            bookmarked: false,
         };
         state.add_connection(conn.clone()).await;
         let _ = app_handle.emit("proxy:connection", &conn);
@@ -1447,6 +1455,7 @@ async fn handle_http_request(
         content_type: None,
         intercepted: false,
         blocked: false,
+        bookmarked: false,
     };
     state.add_connection(conn.clone()).await;
     let _ = app_handle.emit("proxy:connection", &conn);
@@ -1530,6 +1539,7 @@ async fn handle_intercepted_request(
                 content_type: Some(content_type),
                 intercepted: true,
                 blocked: false,
+                bookmarked: false,
             };
             state.add_connection(conn.clone()).await;
             let _ = app_handle.emit("proxy:connection", &conn);
@@ -1623,6 +1633,7 @@ async fn handle_intercepted_request(
                     content_type: Some("text/plain; charset=utf-8".to_string()),
                     intercepted: true,
                     blocked: false,
+                    bookmarked: false,
                 };
                 state.add_connection(conn.clone()).await;
                 let _ = app_handle.emit("proxy:connection", &conn);
@@ -1660,6 +1671,7 @@ async fn handle_intercepted_request(
                 content_type: None,
                 intercepted: true,
                 blocked: false,
+                bookmarked: false,
             };
             state.add_connection(conn.clone()).await;
             let _ = app_handle.emit("proxy:connection", &conn);
@@ -1941,6 +1953,7 @@ async fn serve_block_http(
         content_type: None,
         intercepted: false,
         blocked: true,
+        bookmarked: false,
     };
     state.add_connection(conn.clone()).await;
     let _ = app_handle.emit("proxy:connection", &conn);
@@ -1990,6 +2003,7 @@ async fn serve_block_https(
         content_type: None,
         intercepted: false,
         blocked: true,
+        bookmarked: false,
     };
     state.add_connection(conn.clone()).await;
     let _ = app_handle.emit("proxy:connection", &conn);
@@ -2034,6 +2048,7 @@ async fn serve_block_connect(
         content_type: None,
         intercepted: false,
         blocked: true,
+        bookmarked: false,
     };
     state.add_connection(conn.clone()).await;
     let _ = app_handle.emit("proxy:connection", &conn);
